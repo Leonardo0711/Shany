@@ -47,6 +47,9 @@ class ShanyApp:
         # Cooldown: evita doble detección de interrupt
         self._last_interrupt_time: float = 0.0
         self._interrupt_cooldown_sec: float = 3.0
+        # Cooldown post-cierre: evita que el doble-click reabra sesión
+        self._last_end_session_time: float = 0.0
+        self._end_session_cooldown_sec: float = 2.0
 
         # Botón Físico de Control (Hardware fallback)
         self._btn = SmartButton(
@@ -125,6 +128,10 @@ class ShanyApp:
     def _trigger_wake(self) -> None:
         """Inicia la sesión (equivalente a 'Hola Shany')."""
         if not self._conv.is_active:
+            # Cooldown: no reabrir si acabamos de cerrar por doble-click
+            if time.time() - self._last_end_session_time < self._end_session_cooldown_sec:
+                log.debug("Wake ignorado: cooldown post-cierre activo")
+                return
             log.info("Trigger Wake: Abriendo sesión")
             self._last_wake_time = time.time()
             self._conv.start_session()
@@ -157,6 +164,7 @@ class ShanyApp:
         """Cierra la sesión de golpe (Double Click)."""
         if self._conv.is_active:
             log.info("Trigger End Session: Cerrando por control manual")
+            self._last_end_session_time = time.time()
             self._conv.end_session("manual_double_click")
 
     # ── Signal handling ──────────────────────────────────────────

@@ -1,0 +1,12 @@
+from shany_app_pi.config import ShanyConfig
+c = ShanyConfig()
+print("ref_hola:", c.ref_hola)
+print("existe?:", c.ref_hola.is_file())
+print("ref_shany:", c.ref_shany)
+print("existe?:", c.ref_shany.is_file())
+print("button_pin:", c.button_pin)
+print("mic_gain:", c.mic_gain)
+print("output_gain:", c.output_gain)
+print("output_comp_threshold:", c.output_comp_threshold)
+print("AGENT_ID set?:", bool(c.agent_id))
+print("API_KEY set?:", bool(c.api_key))

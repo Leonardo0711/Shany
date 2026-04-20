@@ -23,7 +23,7 @@ class SmartButton:
         on_double_click: Callable[[], None],
         on_hold: Callable[[], None],
         hold_time: float = 1.0,
-        double_click_threshold: float = 0.4
+        double_click_threshold: float = 0.5
     ):
         """
         Inicializa un botón inteligente.
