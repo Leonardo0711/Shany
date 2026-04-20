@@ -269,12 +269,12 @@ class AudioHub:
                     samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
                     # 1) Ganancia base
-                    samples *= 2.5
+                    samples *= self._cfg.output_gain
 
                     # 2) Compresor suave (soft-knee) — mantiene volumen alto
                     #    sin el "crackle" del clipping duro. Las muestras fuertes
                     #    se comprimen suavemente en vez de cortarse de golpe.
-                    threshold = 0.6
+                    threshold = self._cfg.output_comp_threshold
                     ratio = 0.4  # Compresión por encima del umbral
                     mask = np.abs(samples) > threshold
                     sign = np.sign(samples[mask])
@@ -322,8 +322,8 @@ class AudioHub:
         # 1) Eliminar DC offset (rumble eléctrico del INMP441)
         raw -= np.mean(raw)
 
-        # 2) Ganancia digital 5x — extiende el rango de captación
-        raw *= 5.0
+        # 2) Ganancia digital — extiende el rango de captación
+        raw *= self._cfg.mic_gain
         np.clip(raw, -32768, 32767, out=raw)
 
         processed = raw.astype(np.int16)

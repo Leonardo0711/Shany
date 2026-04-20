@@ -91,6 +91,12 @@ class ShanyConfig:
     send_q_maxsize: int = 400
     out_q_maxsize: int = 1000
 
+    # ── Audio DSP / Tuning ───────────────────────────────────────
+    mic_gain: float = 5.0
+    mic_noise_threshold: int = 30
+    output_gain: float = 2.5
+    output_comp_threshold: float = 0.6
+
     # ── Propiedades derivadas ────────────────────────────────────
     @property
     def chunk(self) -> int:
