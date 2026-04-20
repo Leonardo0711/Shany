@@ -30,7 +30,7 @@ El algoritmo se escribió de forma asíncrona mediante el uso de timers en Pytho
     *   *Acción:* Apaga el altavoz temporalmente, corta el flujo de habla actual del agente e inmediatamente captura el micrófono de forma forzada para oír tu comando.
 *   **Pulsación Doble (Double Click):**
     *   *Comportamiento:* Protocolo de emergencia o término manual del flujo.
-    *   *Acción:* Cierra de golpe la sesión de ElevenLabs de regreso a estado Standby sin esperar inactividad.
+    *   *Acción:* Cierra de golpe la sesión de ElevenLabs de regreso a estado Standby sin esperar inactividad. *(Importante: El tiempo de recepción para el segundo click es de 0.5s. Además, se implementó un "cooldown" donde Shany ignorará el botón y las hotwords durante 2.0s post-cierre para evitar re-inicios por rebote del dedo).*
 
 ---
-*Este registro corresponde a la etapa de madurez técnica del dispositivo. Pendiente de ejecución vía los tests indicados en el plan de implementación.*
+*Este registro corresponde al estado final de producción del hardware.*

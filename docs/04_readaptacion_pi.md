@@ -41,8 +41,14 @@ Tras finalizar el despliegue, intentamos la primera ejecución mediante `run_sha
 - **Causa Técnica:** El hardware I2S (MAX98357/INMP441) configurado mediante el overlay `googlevoicehat` es extremadamente rígido. Solo permite apertura de streams a **48000Hz / 32-bit / Estéreo**.
 - **Impacto:** Shany está configurada para **16000Hz / 16-bit / Mono**.
 
-## 6. Estado Actual y Próximos Pasos
-Hemos completado con éxito toda la base de software y dependencias. El sistema es estable gracias al swap de 1GB. El siguiente paso es implementar un **puente ALSA (plughw)** para que el sistema traduzca automáticamente los 16kHz de la app a los 48kHz que exige el hardware.
+## 6. Estado Actual y Soluciones Implementadas
+Hemos completado con éxito toda la base de software y dependencias. El sistema es totalmente estable y solvente para producción gracias al swap de 1GB y las optimizaciones implementadas.
+
+- **Puente ALSA (`plughw`):** Se implementó exitosamente el puente virtual de ALSA para la conversión automática en hardware de 16kHz a 48kHz sin costo de CPU.
+- **Botón Físico:** Se integró hardware para rescate e interrupción manual de conversaciones.
+- **Audio DSP (Procesamiento Digital):** Se calibró un pipeline completo de audio. El micrófono ahora cancela vibraciones ("dc offset") e incrementa su rango 5x. El parlante incluye un compresor de señal (soft-knee) para eliminar los zumbidos sintéticos manteniendo el volumen alto en 2.5x.
+
+*(Los detalles avanzados del botón y la acústica están desglosados en los documentos 05 y 06 respectivamente).*
 
 ---
 *Documentación generada para registro técnico del proyecto Shany.*
