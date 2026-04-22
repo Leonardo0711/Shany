@@ -86,7 +86,8 @@ class ShanyApp:
     def shutdown(self) -> None:
         """Apaga todos los componentes de forma ordenada."""
         log.info("Apagando Shany …")
-        self._emotion.send_ui_state("idle")  # ESP32: cara de reposo
+        if not self._conv.is_active:
+            self._emotion.send_ui_state("idle")  # ESP32: cara de reposo
         self._conv.shutdown()
         self._hotword.shutdown()
         self._hub.shutdown()
@@ -146,7 +147,16 @@ class ShanyApp:
                 daemon=True
             ).start()
             
-            self._conv.start_session()
+            try:
+                self._conv.start_session()
+            except Exception as e:
+                log.error("Fallo al iniciar sesión: %s", e)
+                # Revertir visual a idle si falla el arranque
+                threading.Thread(
+                    target=self._emotion.send_ui_state, 
+                    args=("idle",), 
+                    daemon=True
+                ).start()
 
     def _trigger_interrupt(self) -> None:
         """Corta al agente para escuchar (equivalente a 'Shany')."""

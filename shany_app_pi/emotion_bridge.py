@@ -46,33 +46,36 @@ class EmotionBridge:
         Callback ejecutado cuando la IA llama a la herramienta 'setEmotion'.
         Envía los datos tanto al terminal como al puerto Serial.
         """
-        self._seq += 1
-        
-        payload = {
-            "type": "emotion",
-            "seq": self._seq,
-            "emotion": parameters.get("emotion", "neutral"),
-            "intensity": float(parameters.get("intensity", 0.5)),
-            "duration_ms": int(parameters.get("duration_ms", 2000)),
-            "blink": bool(parameters.get("blink", True)),
-            "sent_ms": int(time.monotonic() * 1000)
-        }
+        with self._lock:
+            self._seq += 1
+            
+            payload = {
+                "type": "emotion",
+                "seq": self._seq,
+                "emotion": parameters.get("emotion", "neutral"),
+                "intensity": float(parameters.get("intensity", 0.5)),
+                "duration_ms": int(parameters.get("duration_ms", 2000)),
+                "blink": bool(parameters.get("blink", True)),
+                "sent_ms": int(time.monotonic() * 1000)
+            }
 
-        self._send_payload(payload)
+            self._send_payload(payload)
+
         return f"Emotion set to {payload['emotion']} successfully."
 
     def send_speech_state(self, speaking: bool) -> None:
         """Indica si el bot ha empezado o terminado de hablar."""
-        self._seq += 1
-        if not speaking:
-            self._last_mouth = 0.0  # Reset delta al terminar
-        payload = {
-            "type": "speech_state",
-            "seq": self._seq,
-            "speaking": speaking,
-            "sent_ms": int(time.monotonic() * 1000)
-        }
-        self._send_payload(payload)
+        with self._lock:
+            self._seq += 1
+            if not speaking:
+                self._last_mouth = 0.0  # Reset delta al terminar
+            payload = {
+                "type": "speech_state",
+                "seq": self._seq,
+                "speaking": speaking,
+                "sent_ms": int(time.monotonic() * 1000)
+            }
+            self._send_payload(payload)
 
     def send_speech_level(self, mouth: float) -> None:
         """
@@ -81,49 +84,50 @@ class EmotionBridge:
         """
         mouth = round(float(mouth), 2)
 
-        # Filtrado delta: no enviar si el cambio es insignificante
-        # Esto evita saturar el UART con valores casi idénticos
-        if abs(mouth - self._last_mouth) < 0.02:
-            return
+        with self._lock:
+            # Filtrado delta: no enviar si el cambio es insignificante
+            # Esto evita saturar el UART con valores casi idénticos
+            if abs(mouth - self._last_mouth) < 0.02:
+                return
 
-        self._last_mouth = mouth
-        self._seq += 1
+            self._last_mouth = mouth
+            self._seq += 1
 
-        # Formato compacto para speech: menor latencia en UART
-        payload = {
-            "type": "speech",
-            "seq": self._seq,
-            "mouth": mouth,
-            "sent_ms": int(time.monotonic() * 1000)
-        }
-        self._send_payload(payload, is_speech=True)
+            # Formato compacto para speech: menor latencia en UART
+            payload = {
+                "type": "speech",
+                "seq": self._seq,
+                "mouth": mouth,
+                "sent_ms": int(time.monotonic() * 1000)
+            }
+            self._send_payload(payload, is_speech=True)
 
     def send_ui_state(self, state: str) -> None:
         """Cambia el estado visual de la interfaz (ej: listening, thinking)."""
-        self._seq += 1
-        payload = {
-            "type": "ui_state",
-            "seq": self._seq,
-            "state": state,
-            "sent_ms": int(time.monotonic() * 1000)
-        }
-        self._send_payload(payload)
+        with self._lock:
+            self._seq += 1
+            payload = {
+                "type": "ui_state",
+                "seq": self._seq,
+                "state": state,
+                "sent_ms": int(time.monotonic() * 1000)
+            }
+            self._send_payload(payload)
 
     def _send_payload(self, payload: Dict[str, Any], is_speech: bool = False) -> None:
-        """Salida interna a Terminal y UART (Thread-Safe)."""
+        """Salida interna a Terminal y UART (Asume que el caller ya tiene el lock)."""
         line = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
         
         # Imprimir en terminal: estados siempre, speech solo cada 8 paquetes
-        if not is_speech or self._seq % 8 == 0:
+        if not is_speech or payload.get("seq", 0) % 8 == 0:
             print(f"[visual] {line}", flush=True)
 
         if self._ser is not None:
-            with self._lock:
-                try:
-                    self._ser.write((line + "\n").encode("utf-8"))
-                    # Solo flush para paquetes de estado (prioritarios)
-                    # Speech se manda en ráfaga sin flush individual para menor latencia
-                    if not is_speech:
-                        self._ser.flush()
-                except Exception:
-                    log.exception("Fallo crítico enviando datos por UART")
+            try:
+                self._ser.write((line + "\n").encode("utf-8"))
+                # Solo flush para paquetes de estado (prioritarios)
+                # Speech se manda en ráfaga sin flush individual para menor latencia
+                if not is_speech:
+                    self._ser.flush()
+            except Exception:
+                log.exception("Fallo crítico enviando datos por UART")

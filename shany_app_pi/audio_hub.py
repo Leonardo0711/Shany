@@ -80,6 +80,7 @@ class AudioHub:
         # Estado visual
         self._is_talking: bool = False
         self._smoothed_mouth: float = 0.0
+        self._window_rms_max: float = 0.0  # Max RMS entre envíos visuales
 
         # Generación de playback (se incrementa en interrupt)
         self._playback_generation: int = 0
@@ -169,7 +170,7 @@ class AudioHub:
 
     def agent_is_speaking(self) -> bool:
         """Devuelve True si el agente está reproduciendo audio."""
-        if (time.time() - self._last_output_ts) < 0.25:
+        if (time.time() - self._last_output_ts) < 0.45:
             return True
         return not self._out_q.empty()
 
@@ -190,14 +191,14 @@ class AudioHub:
     def output(self, audio: bytes) -> None:
         """Encola audio del agente para reproducir."""
         now = time.time()
-        self._last_output_ts = now
 
-        # Si ya pasó la ventana de drop, cancelarla definitivamente
-        if now >= self._drop_output_until:
-            self._drop_output_until = 0.0
-        else:
-            # Aún en ventana de drop: descartar este chunk
+        if now < self._drop_output_until:
+            # Aún en ventana de drop: descartar este chunk completamente
             return
+
+        # Solo actualizar timestamps si realmente procesamos el audio
+        self._last_output_ts = now
+        self._drop_output_until = 0.0
 
         with self._playback_lock:
             gen = self._playback_generation
@@ -235,6 +236,7 @@ class AudioHub:
         
         self._is_talking = False
         self._smoothed_mouth = 0.0
+        self._window_rms_max = 0.0
         log.debug("Playback interrumpido")
 
     # ── Hotword helper ───────────────────────────────────────────
@@ -291,9 +293,54 @@ class AudioHub:
 
             try:
                 if self._out_stream is not None:
-                    # ── Pipeline de Salida (Calidad de Audio) ────────
                     samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
+                    # ── Sincronía Visual (Lip Sync) ─────────────────
+                    # Extraemos el RMS de la señal RAW (sin ganancia ni compresor)
+                    # para que la boca siga la dinámica original y pueda cerrarse.
+                    try:
+                        if self._visual_bridge:
+                            # 1) Detectar inicio de habla
+                            if not self._is_talking:
+                                self._visual_bridge.send_speech_state(True)
+                                self._is_talking = True
+
+                            # Acumular RMS del chunk actual (raw)
+                            rms = np.sqrt(np.mean(samples**2))
+                            self._window_rms_max = max(self._window_rms_max, rms)
+
+                            # 2) Emitir nivel de boca (~12 Hz)
+                            now = time.time()
+                            if (now - self._last_visual_emit) > 0.08:
+                                window_rms = self._window_rms_max
+                                self._window_rms_max = 0.0  # Reset ventana
+
+                                # Zona muerta: ahora evaluamos el RMS natural sin amplificar
+                                deadzone = 0.02
+                                if window_rms < deadzone:
+                                    mouth_raw = 0.0
+                                else:
+                                    mouth_raw = (window_rms - deadzone) * 5.0
+                                    mouth_raw = min(max(mouth_raw, 0.0), 1.0)
+
+                                # Suavizado asimétrico
+                                if mouth_raw > self._smoothed_mouth:
+                                    alpha = 0.7  # Abre natural y rápido
+                                else:
+                                    alpha = 0.85 # Cierra casi de inmediato al detectar silencio
+
+                                self._smoothed_mouth = ((1.0 - alpha) * self._smoothed_mouth) + (alpha * mouth_raw)
+
+                                # Piso de seguridad
+                                if self._smoothed_mouth < 0.04:
+                                    self._smoothed_mouth = 0.0
+
+                                self._visual_bridge.send_speech_level(self._smoothed_mouth)
+                                self._last_visual_emit = now
+                    except Exception as ve:
+                        log.warning("Error en lip-sync visual (audio no afectado): %s", ve)
+
+                    # ── Pipeline de Salida (Calidad de Audio) ────────
                     # 1) Ganancia base
                     samples *= self._cfg.output_gain
 
@@ -314,51 +361,6 @@ class AudioHub:
 
                     # 4) Clip final de seguridad
                     np.clip(samples, -1.0, 1.0, out=samples)
-
-                    # ── Sincronía Visual (Lip Sync) ─────────────────
-                    # Protegido: un error visual NUNCA debe matar el audio
-                    try:
-                        if self._visual_bridge:
-                            # 1) Detectar inicio de habla (ANTES del write para mejor sincronía)
-                            if not self._is_talking:
-                                self._visual_bridge.send_speech_state(True)
-                                self._is_talking = True
-
-                            # 2) Emitir nivel de boca (~10 Hz — da tiempo a la ESP32 para animar)
-                            now = time.time()
-                            if (now - self._last_visual_emit) > 0.10:
-                                # Cálculo de RMS (Root Mean Square)
-                                rms = np.sqrt(np.mean(samples**2))
-
-                                # Zona muerta: ignorar audio bajo (respiración, ruido)
-                                deadzone = 0.03
-                                if rms < deadzone:
-                                    mouth_raw = 0.0
-                                else:
-                                    mouth_raw = (rms - deadzone) * 5.0
-                                    mouth_raw = min(max(mouth_raw, 0.0), 1.0)
-
-                                # Suavizado asimétrico
-                                #   attack: abre rápido
-                                #   release: CIERRA rápido (visible entre sílabas)
-                                if mouth_raw > self._smoothed_mouth:
-                                    alpha = 0.5
-                                else:
-                                    alpha = 0.55
-
-                                self._smoothed_mouth = ((1.0 - alpha) * self._smoothed_mouth) + (alpha * mouth_raw)
-
-                                # Gravedad: la boca siempre tiende a cerrarse
-                                self._smoothed_mouth = max(0.0, self._smoothed_mouth - 0.05)
-
-                                # Piso de seguridad
-                                if self._smoothed_mouth < 0.04:
-                                    self._smoothed_mouth = 0.0
-
-                                self._visual_bridge.send_speech_level(self._smoothed_mouth)
-                                self._last_visual_emit = now
-                    except Exception as ve:
-                        log.warning("Error en lip-sync visual (audio no afectado): %s", ve)
 
                     # ── Reproducir audio (SIEMPRE, independiente de visual) ──
                     self._out_stream.write(samples.astype(np.float32).tobytes())
