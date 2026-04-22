@@ -18,6 +18,7 @@ from elevenlabs.conversational_ai.conversation import Conversation
 if TYPE_CHECKING:
     from shany_app_pi.audio_hub import HubAudioInterface
     from shany_app_pi.config import ShanyConfig
+    from shany_app_pi.emotion_bridge import EmotionBridge
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +35,11 @@ class ConversationManager:
         self,
         config: ShanyConfig,
         audio_interface: HubAudioInterface,
+        emotion_bridge: EmotionBridge,
     ) -> None:
         self._cfg = config
         self._audio_interface = audio_interface
+        self._emotion = emotion_bridge
         self._client = ElevenLabs(api_key=config.api_key)
 
         self._lock = threading.Lock()
@@ -122,6 +125,8 @@ class ConversationManager:
     # ── Internos ─────────────────────────────────────────────────
 
     def _create_conversation(self) -> Conversation:
+        from elevenlabs.conversational_ai.conversation import ClientTools
+
         def on_agent(resp: str) -> None:
             log.info("Agent: %s", resp)
             self.touch()
@@ -130,6 +135,13 @@ class ConversationManager:
             log.info("User: %s", txt)
             self.touch()
 
+        # Configurar Herramientas de Cliente (Fase 1: Emociones)
+        client_tools = ClientTools()
+        client_tools.register(
+            "setEmotion", 
+            lambda params: self._emotion.set_emotion(params)
+        )
+
         return Conversation(
             self._client,
             self._cfg.agent_id,
@@ -137,6 +149,7 @@ class ConversationManager:
             audio_interface=self._audio_interface,
             callback_agent_response=on_agent,
             callback_user_transcript=on_user,
+            client_tools=client_tools,
         )
 
     def _waiter(self, conv: Conversation) -> None:
@@ -145,6 +158,8 @@ class ConversationManager:
         except Exception:
             pass
         finally:
+            # ESP32: cara de reposo al terminar sesión natural
+            self._emotion.send_ui_state("idle")
             with self._lock:
                 self._active = False
                 self._conversation = None

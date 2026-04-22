@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import time
 from typing import Optional
 
@@ -17,6 +18,7 @@ from shany_app_pi.config import ShanyConfig
 from shany_app_pi.conversation_manager import ConversationManager
 from shany_app_pi.hotword_engine import HotwordEngine
 from shany_app_pi.hardware_button import SmartButton
+from shany_app_pi.emotion_bridge import EmotionBridge
 
 log = logging.getLogger(__name__)
 
@@ -36,10 +38,11 @@ class ShanyApp:
         self._cfg.validate()
 
         # ── Componentes ──────────────────────────────────────────
-        self._hub = AudioHub(self._cfg)
+        self._emotion = EmotionBridge()
+        self._hub = AudioHub(self._cfg, visual_bridge=self._emotion)
         self._audio_interface = HubAudioInterface(self._hub)
         self._hotword = HotwordEngine(self._cfg, self._hub)
-        self._conv = ConversationManager(self._cfg, self._audio_interface)
+        self._conv = ConversationManager(self._cfg, self._audio_interface, self._emotion)
 
         # Anti-solapamiento: evita que "shany" dentro de "hola shany"
         # dispare una interrupción justo después del wake
@@ -83,6 +86,7 @@ class ShanyApp:
     def shutdown(self) -> None:
         """Apaga todos los componentes de forma ordenada."""
         log.info("Apagando Shany …")
+        self._emotion.send_ui_state("idle")  # ESP32: cara de reposo
         self._conv.shutdown()
         self._hotword.shutdown()
         self._hub.shutdown()
@@ -134,6 +138,14 @@ class ShanyApp:
                 return
             log.info("Trigger Wake: Abriendo sesión")
             self._last_wake_time = time.time()
+            
+            # ESP32: despertar visual inmediato (desacoplado para evitar bloqueos)
+            threading.Thread(
+                target=self._emotion.send_ui_state, 
+                args=("listening",), 
+                daemon=True
+            ).start()
+            
             self._conv.start_session()
 
     def _trigger_interrupt(self) -> None:
@@ -165,6 +177,7 @@ class ShanyApp:
         if self._conv.is_active:
             log.info("Trigger End Session: Cerrando por control manual")
             self._last_end_session_time = time.time()
+            self._hub.interrupt()  # Reset visual inmediato (boca + listening)
             self._conv.end_session("manual_double_click")
 
     # ── Signal handling ──────────────────────────────────────────

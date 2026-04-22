@@ -19,6 +19,7 @@ import pyaudio
 
 if TYPE_CHECKING:
     from shany_app_pi.config import ShanyConfig
+    from shany_app_pi.emotion_bridge import EmotionBridge
 
 try:
     from elevenlabs.conversational_ai.conversation import AudioInterface
@@ -40,8 +41,9 @@ class AudioHub:
     - ``interrupt()`` invalida el audio pendiente sin cerrar sesión.
     """
 
-    def __init__(self, config: ShanyConfig) -> None:
+    def __init__(self, config: ShanyConfig, visual_bridge: Optional[EmotionBridge] = None) -> None:
         self._cfg = config
+        self._visual_bridge = visual_bridge
         self._pa = pyaudio.PyAudio()
 
         # Se delega al kernel (ALSA pcm.!default plug) la adaptación del 
@@ -69,10 +71,15 @@ class AudioHub:
         )
         self._stop = threading.Event()
 
-        # Timestamps de gating
+        # Timestamps de gating y visuales
         self._last_output_ts: float = 0.0
+        self._last_visual_emit: float = 0.0
         self._force_listen_until: float = 0.0
         self._drop_output_until: float = 0.0
+
+        # Estado visual
+        self._is_talking: bool = False
+        self._smoothed_mouth: float = 0.0
 
         # Generación de playback (se incrementa en interrupt)
         self._playback_generation: int = 0
@@ -219,6 +226,15 @@ class AudioHub:
         except queue.Empty:
             pass
 
+        # Reset visual inmediato
+        if self._visual_bridge:
+            if self._is_talking:
+                self._visual_bridge.send_speech_state(False)
+                self._visual_bridge.send_speech_level(0.0)
+            self._visual_bridge.send_ui_state("listening")
+        
+        self._is_talking = False
+        self._smoothed_mouth = 0.0
         log.debug("Playback interrumpido")
 
     # ── Hotword helper ───────────────────────────────────────────
@@ -251,8 +267,18 @@ class AudioHub:
     def _output_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                gen, audio = self._out_q.get(timeout=0.25)
+                # El timeout corto nos permite detectar el fin de habla por silencio
+                gen, audio = self._out_q.get(timeout=0.1)
             except queue.Empty:
+                # Si la cola está vacía y estábamos hablando, checar si ya pasó el umbral de silencio
+                if self._is_talking and (time.time() - self._last_output_ts > 0.45):
+                    log.debug("Fin de audio detectado (silencio > 450ms)")
+                    self._smoothed_mouth = 0.0
+                    if self._visual_bridge:
+                        self._visual_bridge.send_speech_state(False)
+                        self._visual_bridge.send_speech_level(0.0)
+                        self._visual_bridge.send_ui_state("listening")
+                    self._is_talking = False
                 continue
             except Exception:
                 continue
@@ -289,9 +315,55 @@ class AudioHub:
                     # 4) Clip final de seguridad
                     np.clip(samples, -1.0, 1.0, out=samples)
 
+                    # ── Sincronía Visual (Lip Sync) ─────────────────
+                    # Protegido: un error visual NUNCA debe matar el audio
+                    try:
+                        if self._visual_bridge:
+                            # 1) Detectar inicio de habla (ANTES del write para mejor sincronía)
+                            if not self._is_talking:
+                                self._visual_bridge.send_speech_state(True)
+                                self._is_talking = True
+
+                            # 2) Emitir nivel de boca (~10 Hz — da tiempo a la ESP32 para animar)
+                            now = time.time()
+                            if (now - self._last_visual_emit) > 0.10:
+                                # Cálculo de RMS (Root Mean Square)
+                                rms = np.sqrt(np.mean(samples**2))
+
+                                # Zona muerta: ignorar audio bajo (respiración, ruido)
+                                deadzone = 0.03
+                                if rms < deadzone:
+                                    mouth_raw = 0.0
+                                else:
+                                    mouth_raw = (rms - deadzone) * 5.0
+                                    mouth_raw = min(max(mouth_raw, 0.0), 1.0)
+
+                                # Suavizado asimétrico
+                                #   attack: abre rápido
+                                #   release: CIERRA rápido (visible entre sílabas)
+                                if mouth_raw > self._smoothed_mouth:
+                                    alpha = 0.5
+                                else:
+                                    alpha = 0.55
+
+                                self._smoothed_mouth = ((1.0 - alpha) * self._smoothed_mouth) + (alpha * mouth_raw)
+
+                                # Gravedad: la boca siempre tiende a cerrarse
+                                self._smoothed_mouth = max(0.0, self._smoothed_mouth - 0.05)
+
+                                # Piso de seguridad
+                                if self._smoothed_mouth < 0.04:
+                                    self._smoothed_mouth = 0.0
+
+                                self._visual_bridge.send_speech_level(self._smoothed_mouth)
+                                self._last_visual_emit = now
+                    except Exception as ve:
+                        log.warning("Error en lip-sync visual (audio no afectado): %s", ve)
+
+                    # ── Reproducir audio (SIEMPRE, independiente de visual) ──
                     self._out_stream.write(samples.astype(np.float32).tobytes())
-            except Exception:
-                pass
+            except Exception as e:
+                log.exception("Error en _output_loop: %s", e)
 
     def _sender_loop(self) -> None:
         while not self._stop.is_set():
