@@ -11,6 +11,7 @@ Asegúrate de que los módulos estén conectados a los siguientes pines GPIO:
 | **INMP441** | SCK            | GPIO18       | 12         |
 | **INMP441** | WS             | GPIO19       | 35         |
 | **INMP441** | SD             | GPIO20       | 38         |
+| **INMP441** | L/R            | GND          |            |
 | **MAX98357**| VIN            | 5V           | 2 o 4      |
 | **MAX98357**| BCLK           | GPIO18       | 12         |
 | **MAX98357**| LRC            | GPIO19       | 35         |

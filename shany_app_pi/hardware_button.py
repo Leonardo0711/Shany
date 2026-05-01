@@ -47,7 +47,9 @@ class SmartButton:
 
         try:
             # gpiozero maneja la resistencia PULL-UP internamente por defecto
-            self.button = Button(pin, hold_time=hold_time)
+            # Se añade bounce_time (100ms) para evitar que el rebote físico 
+            # del resorte se interprete como múltiples clicks rápidos.
+            self.button = Button(pin, hold_time=hold_time, bounce_time=0.1)
             self.button.when_pressed = self._pressed
             self.button.when_released = self._released
             self.button.when_held = self._held
