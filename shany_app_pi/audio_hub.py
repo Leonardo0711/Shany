@@ -73,9 +73,14 @@ class AudioHub:
 
         # Timestamps de gating y visuales
         self._last_output_ts: float = 0.0
+        self._last_playback_write_ts: float = 0.0
         self._last_visual_emit: float = 0.0
         self._force_listen_until: float = 0.0
         self._drop_output_until: float = 0.0
+
+        # Bloqueo extra del micrófono después de que Shany termina de hablar
+        self._mic_guard_until: float = 0.0
+        self._post_speech_mic_guard_sec: float = 0.85
 
         # Estado visual
         self._is_talking: bool = False
@@ -169,10 +174,26 @@ class AudioHub:
     # ── Estado / gating ──────────────────────────────────────────
 
     def agent_is_speaking(self) -> bool:
-        """Devuelve True si el agente está reproduciendo audio."""
-        if (time.time() - self._last_output_ts) < 0.45:
+        """Devuelve True si el agente está hablando o si estamos en cola de seguridad."""
+        now = time.time()
+
+        # Si el output loop marcó que está hablando, confiar en eso
+        if self._is_talking:
             return True
-        return not self._out_q.empty()
+
+        # Si todavía hay audio pendiente por reproducir
+        if not self._out_q.empty():
+            return True
+
+        # Protección corta después del último write real al parlante
+        if (now - self._last_playback_write_ts) < self._post_speech_mic_guard_sec:
+            return True
+
+        # Protección explícita post-habla
+        if now < self._mic_guard_until:
+            return True
+
+        return False
 
     def force_listen_window(self, secs: float) -> None:
         """Fuerza que el mic se envíe al agente durante *secs*."""
@@ -207,13 +228,9 @@ class AudioHub:
         for i in range(0, len(audio), step):
             piece = audio[i : i + step]
             try:
-                self._out_q.put_nowait((gen, piece))
+                self._out_q.put((gen, piece), timeout=0.05)
             except queue.Full:
-                try:
-                    self._out_q.get_nowait()
-                    self._out_q.put_nowait((gen, piece))
-                except Exception:
-                    pass
+                log.warning("Cola de salida llena: se descarta chunk nuevo de audio")
 
     def interrupt(self) -> None:
         """Corta el playback actual sin cerrar la sesión."""
@@ -237,6 +254,8 @@ class AudioHub:
         self._is_talking = False
         self._smoothed_mouth = 0.0
         self._window_rms_max = 0.0
+        self._mic_guard_until = 0.0
+        self._last_playback_write_ts = 0.0
         log.debug("Playback interrumpido")
 
     # ── Hotword helper ───────────────────────────────────────────
@@ -248,10 +267,16 @@ class AudioHub:
     # ── Hilos internos ───────────────────────────────────────────
 
     def _should_send_real_mic(self) -> bool:
-        if time.time() < self._force_listen_until:
-            return True
+        now = time.time()
+
+        # Si Shany está hablando o acaba de hablar, NO mandar mic real al agente
         if self.agent_is_speaking():
             return False
+
+        # Solo permitir force_listen cuando ya no hay audio del agente
+        if now < self._force_listen_until:
+            return True
+
         return True
 
     def _find_device_index(self, name_part: str) -> Optional[int]:
@@ -273,13 +298,21 @@ class AudioHub:
                 gen, audio = self._out_q.get(timeout=0.1)
             except queue.Empty:
                 # Si la cola está vacía y estábamos hablando, checar si ya pasó el umbral de silencio
-                if self._is_talking and (time.time() - self._last_output_ts > 0.45):
-                    log.debug("Fin de audio detectado (silencio > 450ms)")
+                now = time.time()
+                if self._is_talking and (now - self._last_playback_write_ts > 0.55):
+                    log.debug("Fin de audio detectado (silencio > 550ms)")
+
                     self._smoothed_mouth = 0.0
+                    self._window_rms_max = 0.0
+
+                    # Mantener micrófono cerrado un poco más para evitar eco de última palabra
+                    self._mic_guard_until = now + self._post_speech_mic_guard_sec
+
                     if self._visual_bridge:
                         self._visual_bridge.send_speech_state(False)
                         self._visual_bridge.send_speech_level(0.0)
                         self._visual_bridge.send_ui_state("listening")
+
                     self._is_talking = False
                 continue
             except Exception:
@@ -364,6 +397,9 @@ class AudioHub:
 
                     # ── Reproducir audio (SIEMPRE, independiente de visual) ──
                     self._out_stream.write(samples.astype(np.float32).tobytes())
+
+                    # Este timestamp representa sonido realmente enviado al parlante
+                    self._last_playback_write_ts = time.time()
             except Exception as e:
                 log.exception("Error en _output_loop: %s", e)
 
