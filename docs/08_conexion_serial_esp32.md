@@ -53,6 +53,17 @@ Indica cambios en el flujo de la aplicación.
 ```
 *   Se envía automáticamente al terminar de hablar para que los ojos cambien a modo "escucha".
 
+### E. Estado del Sistema (`type: system`)
+Indica el ciclo de vida del programa de la Raspberry Pi. Este mensaje es clave para el LED indicador.
+```json
+{"type": "system", "seq": 1, "state": "ready", "sent_ms": 12345}
+```
+*   `state: "ready"` → El programa terminó de cargar AudioHub, HotwordEngine y todo lo necesario. **El usuario ya puede decir "Hola Shany".** El ESP32 hace parpadear el LED cian por 1.6 segundos.
+*   `state: "booting"` → La Raspberry está reiniciando. El ESP32 apaga el LED y espera.
+
+> [!NOTE]
+> Este mensaje se envía una sola vez al arrancar, justo antes de entrar al loop principal. No se envía periódicamente.
+
 - **seq**: Contador secuencial para detectar pérdida de paquetes.
 - **sent_ms**: Tiempo interno de la Pi (monotónico) para medir latencia.
 

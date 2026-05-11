@@ -1,0 +1,37 @@
+[Unit]
+Description=Shany AI Assistant (Raspberry Pi)
+# Esperar a que la red esté lista (para ElevenLabs API)
+# y a que el sistema de sonido ALSA esté disponible
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ietsi
+Group=ietsi
+WorkingDirectory=/home/ietsi
+
+# Entorno necesario para PyAudio/ALSA
+Environment=PYTHONPATH=/home/ietsi
+Environment=HOME=/home/ietsi
+
+# Ejecutar usando el virtualenv
+ExecStart=/home/ietsi/shany_env/bin/python3 -m shany_app_pi
+
+# Matar procesos previos antes de iniciar
+ExecStartPre=/usr/bin/pkill -f shany_app_pi || /bin/true
+
+# Si Shany crashea, reiniciar después de 5 segundos
+Restart=on-failure
+RestartSec=5
+
+# Dar tiempo suficiente para cargar modelos de hotword
+TimeoutStartSec=120
+
+# Logging al journal del sistema
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shany
+
+[Install]
+WantedBy=multi-user.target

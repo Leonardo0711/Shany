@@ -76,6 +76,13 @@ class ShanyApp:
             "En conversación: di 'Shany' para interrumpir SIN cortar sesión."
         )
 
+        # ── Notificar al ESP32 que Shany está 100% lista ─────────
+        # Este mensaje se envía DESPUÉS de que AudioHub, HotwordEngine
+        # y el monitor de inactividad estén corriendo. Es el momento
+        # real en que el usuario ya puede hablar.
+        self._emotion.send_system_state("ready")
+        log.info("Sistema listo → ESP32 notificado (system:ready)")
+
         try:
             self._main_loop()
         except (KeyboardInterrupt, SystemExit):

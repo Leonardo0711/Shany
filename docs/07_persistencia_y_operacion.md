@@ -32,48 +32,93 @@ Para verificar que el filtrado digital o el "hotword engine" no estén ahorcando
 
 Para que el robot viva tan pronto lo enchufes a la pared, debes volverlo un servicio oficial del sistema Linux.
 
-### Crear el servicio:
-Ejecuta `sudo nano /etc/systemd/system/shany.service` y pega esto:
+### Archivo de servicio (`shany.service`):
+
+El archivo ya viene incluido dentro de `shany_app_pi/shany.service` con la configuración optimizada:
 
 ```ini
 [Unit]
-Description=Shany AI Conversational Assistant
-After=network.target sound.target
+Description=Shany AI Assistant (Raspberry Pi)
+After=network-online.target sound.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=ietsi
+Group=ietsi
 WorkingDirectory=/home/ietsi
-ExecStart=/bin/bash /home/ietsi/run_shany.sh
+Environment=PYTHONPATH=/home/ietsi
+Environment=HOME=/home/ietsi
+ExecStart=/home/ietsi/shany_env/bin/python3 -m shany_app_pi
+ExecStartPre=/usr/bin/pkill -f shany_app_pi || /bin/true
 Restart=on-failure
 RestartSec=5
-# Esto evita que inicie antes de que el micrófono ALSA esté listo
-ExecStartPre=/bin/sleep 10 
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shany
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Habilitar y controlar Shany:
-Una vez guardado el archivo, ejecuta estos comandos para encenderlo:
+**Mejoras respecto a la versión anterior:**
+- Usa `network-online.target` en vez de `network.target` → espera a que la red esté realmente conectada (necesario para ElevenLabs API).
+- Ejecuta Python directamente sin pasar por el shell script → menos overhead.
+- `TimeoutStartSec=120` → da 2 minutos al modelo de hotword para cargar sin que systemd lo mate.
+- `ExecStartPre` mata procesos previos automáticamente.
+
+### Instalación automática:
+
+Se incluye un script de instalación que automatiza todo el proceso:
 
 ```bash
-# Recargar el sistema de servicios
-sudo systemctl daemon-reload
+# Conectar vía SSH
+ssh ietsi@shany.local
 
-# Habilitar para que inicie en cada reinicio de la Raspberry
-sudo systemctl enable shany.service
-
-# Iniciar ahora mismo sin necesidad de reiniciar la Pi
-sudo systemctl start shany.service
+# Ejecutar el instalador (requiere sudo)
+sudo bash /home/ietsi/shany_app_pi/install_service.sh
 ```
 
-### Revisar cómo piensa Shany (Logs en Vivo):
-Dado que ahora corre de fondo, si quieres ver qué está haciendo (*si detectó un tap en el botón, si ElevenLabs contestó, etc.*), solo debes invocar sus logs de sistema:
+El script realiza:
+1. Detiene el servicio anterior (si existía).
+2. Copia `shany.service` a `/etc/systemd/system/`.
+3. Recarga systemd.
+4. Habilita el arranque automático.
+5. Inicia Shany inmediatamente.
+
+### Señal `system:ready` al ESP32:
+
+Al iniciar, Shany envía un mensaje JSON al ESP32 por UART cuando está **realmente lista** para escuchar. Esto ocurre **después** de:
+
+1. ✅ AudioHub inicializado (micrófono + speaker).
+2. ✅ HotwordEngine cargado (modelo neuronal Resnet50).
+3. ✅ Monitor de inactividad activo.
+
+Solo entonces se envía:
+```json
+{"type":"system","state":"ready","seq":1,"sent_ms":12345}
+```
+
+El ESP32 recibe este mensaje y hace parpadear el **LED RGB en cian** durante 1.6 segundos, indicando al usuario que ya puede decir "Hola Shany". Antes de recibir este mensaje, el LED permanece apagado.
+
+### Habilitar y controlar Shany (referencia rápida):
 
 ```bash
-# Ver los logs en tiempo real (Ctrl+C para salir)
-sudo journalctl -u shany.service -f
+# Estado del servicio
+sudo systemctl status shany
+
+# Logs en tiempo real (Ctrl+C para salir)
+sudo journalctl -u shany -f
+
+# Reiniciar
+sudo systemctl restart shany
+
+# Detener
+sudo systemctl stop shany
+
+# Desactivar arranque automático
+sudo systemctl disable shany
 ```
 
 ---

@@ -102,6 +102,18 @@ class EmotionBridge:
             }
             self._send_payload(payload, is_speech=True)
 
+    def send_system_state(self, state: str) -> None:
+        """Envía estado del sistema al ESP32 (ej: 'booting', 'ready')."""
+        with self._lock:
+            self._seq += 1
+            payload = {
+                "type": "system",
+                "seq": self._seq,
+                "state": state,
+                "sent_ms": int(time.monotonic() * 1000)
+            }
+            self._send_payload(payload)
+
     def send_ui_state(self, state: str) -> None:
         """Cambia el estado visual de la interfaz (ej: listening, thinking)."""
         with self._lock:
