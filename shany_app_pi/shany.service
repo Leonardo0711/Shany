@@ -18,8 +18,8 @@ Environment=HOME=/home/ietsi
 # Ejecutar usando el virtualenv
 ExecStart=/home/ietsi/shany_env/bin/python3 -m shany_app_pi
 
-# Matar procesos previos antes de iniciar
-ExecStartPre=/usr/bin/pkill -f shany_app_pi || /bin/true
+# Matar procesos previos antes de iniciar (el '-' ignora errores si no hay proceso)
+ExecStartPre=-/usr/bin/pkill -f shany_app_pi
 
 # Si Shany crashea, reiniciar después de 5 segundos
 Restart=on-failure
