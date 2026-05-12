@@ -87,6 +87,14 @@ class AudioHub:
         self._smoothed_mouth: float = 0.0
         self._window_rms_max: float = 0.0  # Max RMS entre envíos visuales
 
+        # VAD local para filtrar ruido antes de enviar al agente
+        self._mic_vad_active: bool = False
+        self._mic_vad_hold_until: float = 0.0
+        self._mic_vad_hold_sec: float = 0.30  # 300ms de hold post-voz
+
+        # AGC — Automatic Gain Control
+        self._agc_gain: float = config.mic_gain  # Inicia en la ganancia base
+
         # Generación de playback (se incrementa en interrupt)
         self._playback_generation: int = 0
         self._playback_lock = threading.Lock()
@@ -228,12 +236,14 @@ class AudioHub:
         for i in range(0, len(audio), step):
             piece = audio[i : i + step]
             try:
-                self._out_q.put((gen, piece), timeout=0.05)
+                self._out_q.put_nowait((gen, piece))
             except queue.Full:
-                log.warning("Cola de salida llena: se descarta chunk nuevo de audio")
+                # Cola llena: descartamos sin bloquear para no frenar
+                # el hilo de callback de ElevenLabs.
+                pass
 
     def interrupt(self) -> None:
-        """Corta el playback actual sin cerrar la sesión."""
+        """Corta el playback actual sin cerrar la sesión (solo audio)."""
         with self._playback_lock:
             self._playback_generation += 1
 
@@ -244,12 +254,11 @@ class AudioHub:
         except queue.Empty:
             pass
 
-        # Reset visual inmediato
-        if self._visual_bridge:
-            if self._is_talking:
-                self._visual_bridge.send_speech_state(False)
-                self._visual_bridge.send_speech_level(0.0)
-            self._visual_bridge.send_ui_state("listening")
+        # Reset estado de habla interno (sin tocar visuals —
+        # los visuals los controla app.py desde los triggers del botón)
+        if self._is_talking and self._visual_bridge:
+            self._visual_bridge.send_speech_state(False)
+            self._visual_bridge.send_speech_level(0.0)
         
         self._is_talking = False
         self._smoothed_mouth = 0.0
@@ -304,6 +313,7 @@ class AudioHub:
 
                     self._smoothed_mouth = 0.0
                     self._window_rms_max = 0.0
+                    self._is_talking = False  # Marcar ANTES de enviar visual (evita repetir)
 
                     # Mantener micrófono cerrado un poco más para evitar eco de última palabra
                     self._mic_guard_until = now + self._post_speech_mic_guard_sec
@@ -313,7 +323,6 @@ class AudioHub:
                         self._visual_bridge.send_speech_level(0.0)
                         self._visual_bridge.send_ui_state("listening")
 
-                    self._is_talking = False
                 continue
             except Exception:
                 continue
@@ -432,13 +441,48 @@ class AudioHub:
         # 1) Eliminar DC offset (rumble eléctrico del INMP441)
         raw -= np.mean(raw)
 
-        # 2) Ganancia digital — extiende el rango de captación
-        raw *= self._cfg.mic_gain
+        # 2) AGC — Automatic Gain Control
+        #    Ajusta la ganancia dinámicamente: amplifica mucho cuando
+        #    estás lejos del mic, poco cuando estás cerca. Así ElevenLabs
+        #    siempre recibe un volumen consistente (~3000 RMS).
+        frame_rms = float(np.sqrt(np.mean(raw ** 2)))
+
+        if frame_rms > 15.0:  # Por encima del piso de ruido del INMP441
+            target_gain = 3000.0 / max(frame_rms, 1.0)
+            target_gain = float(np.clip(target_gain, 1.0, 25.0))
+
+            if target_gain < self._agc_gain:
+                alpha = 0.5    # Baja rápido (protege contra clipping)
+            else:
+                alpha = 0.05   # Sube lento (evita amplificar ruido en pausas)
+            self._agc_gain = alpha * target_gain + (1.0 - alpha) * self._agc_gain
+        else:
+            # Silencio: decaer ganancia gradualmente al baseline
+            self._agc_gain = max(self._agc_gain * 0.98, self._cfg.mic_gain)
+
+        raw *= self._agc_gain
         np.clip(raw, -32768, 32767, out=raw)
 
         processed = raw.astype(np.int16)
 
+        # 3) VAD local con histéresis — detecta voz usando RMS (más
+        #    estable que peak). Cuando detecta voz, mantiene el mic
+        #    abierto 300ms extra para no cortar finales de palabras.
+        #    Solo envía silencio al agente cuando hay silencio real.
+        #    El hotword SIEMPRE recibe audio real (no se aplica gate ahí).
+        rms = int(np.sqrt(np.mean(processed.astype(np.float32) ** 2)))
+        now_mono = time.monotonic()
+
+        if rms >= self._cfg.mic_noise_threshold:
+            # Voz detectada: activar VAD y extender ventana de hold
+            self._mic_vad_active = True
+            self._mic_vad_hold_until = now_mono + self._mic_vad_hold_sec
+        elif now_mono >= self._mic_vad_hold_until:
+            # Silencio sostenido tras el hold: cerrar gate
+            self._mic_vad_active = False
+
         processed_bytes = processed.tobytes()
+        agent_bytes = processed_bytes if self._mic_vad_active else b"\x00" * len(processed_bytes)
 
         # 1) Hotword recibe SIEMPRE audio real (ya amplificado)
         try:
@@ -452,14 +496,14 @@ class AudioHub:
         except Exception:
             pass
 
-        # 2) Cola mic → agente (audio amplificado)
+        # 2) Cola mic → agente (con noise gate aplicado)
         try:
             if self._send_q.full():
                 try:
                     self._send_q.get_nowait()
                 except Exception:
                     pass
-            self._send_q.put_nowait(processed_bytes)
+            self._send_q.put_nowait(agent_bytes)
         except Exception:
             pass
 

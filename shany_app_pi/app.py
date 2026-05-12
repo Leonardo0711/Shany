@@ -181,10 +181,13 @@ class ShanyApp:
         except Exception:
             self._hub.interrupt()
 
-        # 2) Ignorar audio del agente un rato
+        # 2) Visual: solo el botón físico cambia la cara a "escuchando"
+        self._emotion.send_ui_state("listening")
+
+        # 3) Ignorar audio del agente un rato
         self._hub.drop_agent_audio_window(self._cfg.drop_agent_audio_secs)
 
-        # 3) Dejar pasar tu voz al agente
+        # 4) Dejar pasar tu voz al agente
         self._hub.force_listen_window(self._cfg.force_listen_secs)
 
         self._conv.touch()
@@ -194,7 +197,8 @@ class ShanyApp:
         if self._conv.is_active:
             log.info("Trigger End Session: Cerrando por control manual")
             self._last_end_session_time = time.time()
-            self._hub.interrupt()  # Reset visual inmediato (boca + listening)
+            self._hub.interrupt()  # Limpiar audio pendiente
+            self._emotion.send_ui_state("listening")  # Visual: feedback inmediato
             self._conv.end_session("manual_double_click")
 
     # ── Signal handling ──────────────────────────────────────────

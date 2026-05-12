@@ -1,7 +1,9 @@
 #include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <ArduinoJson.h>
+#include <Adafruit_INA219.h>
 #include <math.h>
 
 // -----------------------------------------------------------------------------
@@ -20,8 +22,8 @@ GFXcanvas16 canvas(320, 240);
 
 // -----------------------------------------------------------------------------
 // UART DESDE RASPBERRY
-// Raspberry TX GPIO14 -> ESP32 RX
-// Raspberry RX GPIO15 <- ESP32 TX opcional
+// Raspberry TX GPIO14 -> ESP32 RX GPIO18
+// Raspberry RX GPIO15 <- ESP32 TX GPIO17 opcional
 // GND Raspberry -> GND ESP32
 // -----------------------------------------------------------------------------
 #define SHANY_RX 18
@@ -31,7 +33,108 @@ HardwareSerial ShanyUart(1);
 String uartLine = "";
 
 // -----------------------------------------------------------------------------
-// COLORES
+// INA219 - BATERIA
+// INA SDA -> GPIO 8
+// INA SCL -> GPIO 9
+// INA VCC -> 3.3V
+// INA GND -> GND comun
+// VIN+ y VIN- van EN SERIE con el positivo de la bateria
+// -----------------------------------------------------------------------------
+#define INA_SDA 8
+#define INA_SCL 9
+
+Adafruit_INA219 ina219;
+
+bool inaOk = false;
+
+float inaBusVoltage_V = 0.0f;
+float inaShuntVoltage_mV = 0.0f;
+float inaBatteryVoltage_V = 0.0f;
+float inaCurrent_mA = 0.0f;
+float inaPower_mW = 0.0f;
+int batteryPercent = 0;
+
+unsigned long lastInaReadMs = 0;
+unsigned long lastInaPrintMs = 0;
+
+const unsigned long INA_READ_INTERVAL_MS = 500;
+const unsigned long INA_PRINT_INTERVAL_MS = 2000;
+
+// Umbrales para una celda Li-ion / LiPo 3.7 V nominal.
+// Si usas 2 celdas en serie, estos valores NO sirven.
+const float BATTERY_FULL_V     = 4.20f;
+const float BATTERY_HIGH_V     = 3.85f;
+const float BATTERY_MEDIUM_V   = 3.65f;
+const float BATTERY_LOW_V      = 3.60f;  // desde aqui avisa bateria baja
+const float BATTERY_CRITICAL_V = 3.45f;  // aviso mas insistente
+
+// -----------------------------------------------------------------------------
+// LED RGB
+// -----------------------------------------------------------------------------
+// GPIO10 -> rojo
+// GPIO11 -> verde
+// GPIO12 -> azul
+//
+// Si tu LED RGB es catodo comun:
+//   comun -> GND
+//   RGB_COMMON_ANODE = false
+//
+// Si tu LED RGB es anodo comun:
+//   comun -> 3.3V
+//   RGB_COMMON_ANODE = true
+// -----------------------------------------------------------------------------
+#define RGB_R 10
+#define RGB_G 11
+#define RGB_B 12
+
+// Si tu RGB externo no prende bien, cambia esto a true.
+const bool RGB_COMMON_ANODE = true;
+const float SHANY_RGB_BRIGHTNESS = 0.03f;  // 3% de brillo
+
+// Canales PWM para ESP32 Arduino Core 2.x.
+// En Core 3.x se usa directamente el pin.
+const int RGB_CH_R = 0;
+const int RGB_CH_G = 1;
+const int RGB_CH_B = 2;
+
+const int RGB_PWM_FREQ = 5000;
+const int RGB_PWM_RESOLUTION = 8;
+
+enum BatteryLevel {
+  BAT_UNKNOWN,
+  BAT_HIGH,
+  BAT_MEDIUM,
+  BAT_LOW,
+  BAT_CRITICAL
+};
+
+enum ShanyLedMode {
+  LED_WAITING_RPI,
+  LED_READY,
+  LED_LISTENING,
+  LED_THINKING,
+  LED_SPEAKING
+};
+
+ShanyLedMode ledMode = LED_WAITING_RPI;
+bool raspberryReady = false;
+
+unsigned long bootStartedAt = 0;
+
+// Ya no se usa intro de bateria porque el LED no debe quedar prendido al inicio.
+const unsigned long BATTERY_INTRO_MS = 0;
+
+// Aviso corto cuando Raspberry ya esta lista.
+bool readyFlashActive = false;
+unsigned long readyFlashStartMs = 0;
+const unsigned long READY_FLASH_MS = 1600;
+
+// Aviso de bateria baja sin dejar el LED prendido todo el tiempo.
+const unsigned long LOW_BATTERY_BLINK_PERIOD_MS = 10000;
+const unsigned long CRITICAL_BATTERY_BLINK_PERIOD_MS = 3500;
+
+// -----------------------------------------------------------------------------
+// COLORES DE LA CARA
 // -----------------------------------------------------------------------------
 #define BLACK      0x0000
 #define MINT_CORE  0xC7FD
@@ -125,8 +228,6 @@ float mouthTarget = 0.0f;
 float mouthDisplay = 0.0f;
 float emotionIntensity = 0.6f;
 
-// Para cerrar la boca entre paquetes speech.
-// Raspberry suele mandar speech cada ~80 ms. Si pasa más de esto, cerramos.
 unsigned long lastMouthPacketMs = 0;
 const unsigned long MOUTH_PACKET_TIMEOUT_MS = 120;
 
@@ -316,6 +417,286 @@ void clearCanvas() {
 
 void scheduleNextBlink() {
   nextBlinkTime = millis() + random(2300, 5200);
+}
+
+// -----------------------------------------------------------------------------
+// LED RGB CON PWM LEDC
+// -----------------------------------------------------------------------------
+void setupOnePwmChannel(int pin, int channel) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(pin, RGB_PWM_FREQ, RGB_PWM_RESOLUTION);
+#else
+  ledcSetup(channel, RGB_PWM_FREQ, RGB_PWM_RESOLUTION);
+  ledcAttachPin(pin, channel);
+#endif
+}
+
+void writeOnePwmChannel(int pin, int channel, int value) {
+  value = constrain(value, 0, 255);
+
+  if (RGB_COMMON_ANODE) {
+    value = 255 - value;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, value);
+#else
+  ledcWrite(channel, value);
+#endif
+}
+
+void setRgb(int r, int g, int b) {
+  r = constrain(r, 0, 255);
+  g = constrain(g, 0, 255);
+  b = constrain(b, 0, 255);
+
+  r = (int)(r * SHANY_RGB_BRIGHTNESS);
+  g = (int)(g * SHANY_RGB_BRIGHTNESS);
+  b = (int)(b * SHANY_RGB_BRIGHTNESS);
+
+  writeOnePwmChannel(RGB_R, RGB_CH_R, r);
+  writeOnePwmChannel(RGB_G, RGB_CH_G, g);
+  writeOnePwmChannel(RGB_B, RGB_CH_B, b);
+}
+
+void setupRgbLed() {
+  pinMode(RGB_R, OUTPUT);
+  pinMode(RGB_G, OUTPUT);
+  pinMode(RGB_B, OUTPUT);
+
+  setupOnePwmChannel(RGB_R, RGB_CH_R);
+  setupOnePwmChannel(RGB_G, RGB_CH_G);
+  setupOnePwmChannel(RGB_B, RGB_CH_B);
+
+  // El LED inicia apagado.
+  setRgb(0, 0, 0);
+
+  Serial.println("LED RGB listo. Permanecera apagado salvo bateria baja o Raspberry lista.");
+}
+
+int blinkValue(unsigned long periodMs, int lowValue, int highValue) {
+  unsigned long phase = millis() % periodMs;
+
+  if (phase < periodMs / 2) {
+    return highValue;
+  }
+
+  return lowValue;
+}
+
+int pulseValue(unsigned long periodMs, int minValue, int maxValue) {
+  float phase = (float)(millis() % periodMs) / (float)periodMs;
+  float s = (sinf(phase * 2.0f * 3.1415926f) + 1.0f) * 0.5f;
+  return minValue + (int)((maxValue - minValue) * s);
+}
+
+BatteryLevel getBatteryLevel() {
+  if (!inaOk) {
+    return BAT_UNKNOWN;
+  }
+
+  if (inaBatteryVoltage_V <= 0.5f) {
+    return BAT_UNKNOWN;
+  }
+
+  if (inaBatteryVoltage_V < BATTERY_CRITICAL_V) {
+    return BAT_CRITICAL;
+  }
+
+  if (inaBatteryVoltage_V < BATTERY_LOW_V) {
+    return BAT_LOW;
+  }
+
+  if (inaBatteryVoltage_V < BATTERY_MEDIUM_V) {
+    return BAT_MEDIUM;
+  }
+
+  return BAT_HIGH;
+}
+
+int estimateBatteryPercent(float voltage) {
+  if (voltage <= BATTERY_LOW_V) {
+    return 0;
+  }
+
+  if (voltage >= BATTERY_FULL_V) {
+    return 100;
+  }
+
+  float p = (voltage - BATTERY_LOW_V) / (BATTERY_FULL_V - BATTERY_LOW_V);
+  return (int)(p * 100.0f);
+}
+
+void updateStatusLed() {
+  BatteryLevel bat = getBatteryLevel();
+  unsigned long now = millis();
+
+  // -------------------------------------------------------------
+  // PRIORIDAD 1: bateria critica
+  // Parpadeo rojo doble cada 3.5 s.
+  // -------------------------------------------------------------
+  if (bat == BAT_CRITICAL) {
+    unsigned long phase = now % CRITICAL_BATTERY_BLINK_PERIOD_MS;
+
+    if ((phase < 180) || (phase >= 360 && phase < 540)) {
+      setRgb(255, 0, 0);       // rojo
+    } else {
+      setRgb(0, 0, 0);
+    }
+
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // PRIORIDAD 2: aviso corto de Raspberry lista
+  // Cian parpadeante durante aprox. 1.6 s y luego se apaga.
+  // -------------------------------------------------------------
+  if (readyFlashActive) {
+    unsigned long elapsed = now - readyFlashStartMs;
+
+    if (elapsed < READY_FLASH_MS) {
+      unsigned long phase = elapsed % 400;
+
+      if (phase < 200) {
+        setRgb(0, 180, 255);   // cian suave
+      } else {
+        setRgb(0, 0, 0);
+      }
+
+      return;
+    }
+
+    readyFlashActive = false;
+    setRgb(0, 0, 0);
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // PRIORIDAD 3: bateria baja
+  // Parpadeo naranja/rojo doble cada 10 s.
+  // No queda encendido permanente.
+  // -------------------------------------------------------------
+  if (bat == BAT_LOW) {
+    unsigned long phase = now % LOW_BATTERY_BLINK_PERIOD_MS;
+
+    if ((phase < 180) || (phase >= 360 && phase < 540)) {
+      setRgb(255, 70, 0);      // naranja rojizo
+    } else {
+      setRgb(0, 0, 0);
+    }
+
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // Estado normal: LED apagado.
+  // No se prende en listening, speaking ni ready.
+  // -------------------------------------------------------------
+  setRgb(0, 0, 0);
+}
+
+void markRaspberryReady() {
+  if (!raspberryReady) {
+    raspberryReady = true;
+
+    readyFlashActive = true;
+    readyFlashStartMs = millis();
+
+    Serial.println("Raspberry detectada: Shany lista para escuchar.");
+    Serial.println("Indicador LED: parpadeo cian corto.");
+  }
+}
+
+// -----------------------------------------------------------------------------
+// INA219
+// -----------------------------------------------------------------------------
+void setupIna() {
+  Wire.begin(INA_SDA, INA_SCL);
+
+  if (ina219.begin()) {
+    inaOk = true;
+    ina219.setCalibration_32V_2A();
+    Serial.println("INA219 detectado correctamente.");
+  } else {
+    inaOk = false;
+    Serial.println("ERROR: No se detecto INA219. Revisa SDA, SCL, VCC y GND.");
+  }
+}
+
+void updateIna() {
+  unsigned long now = millis();
+
+  if (!inaOk) {
+    return;
+  }
+
+  if (now - lastInaReadMs < INA_READ_INTERVAL_MS) {
+    return;
+  }
+
+  lastInaReadMs = now;
+
+  inaBusVoltage_V = ina219.getBusVoltage_V();
+  inaShuntVoltage_mV = ina219.getShuntVoltage_mV();
+  inaCurrent_mA = ina219.getCurrent_mA();
+  inaPower_mW = ina219.getPower_mW();
+
+  inaBatteryVoltage_V = inaBusVoltage_V + (inaShuntVoltage_mV / 1000.0f);
+  batteryPercent = estimateBatteryPercent(inaBatteryVoltage_V);
+
+  if (now - lastInaPrintMs >= INA_PRINT_INTERVAL_MS) {
+    lastInaPrintMs = now;
+
+    Serial.println("----- INA219 / BATERIA -----");
+    Serial.print("Voltaje bus VIN-: ");
+    Serial.print(inaBusVoltage_V, 3);
+    Serial.println(" V");
+
+    Serial.print("Caida shunt: ");
+    Serial.print(inaShuntVoltage_mV, 3);
+    Serial.println(" mV");
+
+    Serial.print("Voltaje bateria aprox: ");
+    Serial.print(inaBatteryVoltage_V, 3);
+    Serial.println(" V");
+
+    Serial.print("Corriente: ");
+    Serial.print(inaCurrent_mA, 2);
+    Serial.println(" mA");
+
+    Serial.print("Potencia: ");
+    Serial.print(inaPower_mW, 2);
+    Serial.println(" mW");
+
+    Serial.print("Bateria estimada: ");
+    Serial.print(batteryPercent);
+    Serial.println(" %");
+
+    BatteryLevel level = getBatteryLevel();
+
+    Serial.print("Estado bateria: ");
+    if (level == BAT_HIGH) {
+      Serial.println("ALTA");
+    }
+    else if (level == BAT_MEDIUM) {
+      Serial.println("MEDIA");
+    }
+    else if (level == BAT_LOW) {
+      Serial.println("BAJA");
+    }
+    else if (level == BAT_CRITICAL) {
+      Serial.println("CRITICA");
+    }
+    else {
+      Serial.println("DESCONOCIDA");
+    }
+
+    if (inaCurrent_mA < -20.0f) {
+      Serial.println("ADVERTENCIA: corriente negativa. Puede que VIN+ y VIN- esten invertidos.");
+    }
+
+    Serial.println("----------------------------");
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -1096,7 +1477,6 @@ FaceExpression mapEmotionToFace(String emotion) {
     return FACE_DOUBT;
   }
 
-  // Compatibilidad por si ElevenLabs manda nombres antiguos
   if (emotion == "calma") {
     return FACE_DEFAULT;
   }
@@ -1175,9 +1555,23 @@ void stopSpeakingMode() {
 
   if (sessionActive) {
     requestFace(FACE_LISTENING);
+    ledMode = LED_LISTENING;
+  } else {
+    ledMode = LED_READY;
   }
 
   Serial.println("Speech: stop");
+}
+
+void enterThinkingMode() {
+  sessionActive = true;
+  uiMode = UI_LISTENING;
+  isSpeaking = false;
+
+  mouthTarget = 0.0f;
+  requestFace(FACE_DOUBT);
+
+  Serial.println("UI: thinking");
 }
 
 // -----------------------------------------------------------------------------
@@ -1199,9 +1593,25 @@ void handleJson(String payload) {
     return;
   }
 
+  markRaspberryReady();
+
   String type = doc["type"] | "";
 
-  if (type == "ui_state") {
+  if (type == "system") {
+    String state = doc["state"] | "";
+
+    if (state == "ready") {
+      markRaspberryReady();
+      Serial.println("SYSTEM: ready");
+    }
+    else if (state == "booting") {
+      raspberryReady = false;
+      readyFlashActive = false;
+      setRgb(0, 0, 0);
+      Serial.println("SYSTEM: booting");
+    }
+  }
+  else if (type == "ui_state") {
     String state = doc["state"] | "";
 
     if (state == "idle") {
@@ -1215,10 +1625,7 @@ void handleJson(String payload) {
       requestFace(FACE_SLEEPING);
     }
     else if (state == "thinking") {
-      sessionActive = true;
-      uiMode = UI_LISTENING;
-      isSpeaking = false;
-      requestFace(FACE_DOUBT);
+      enterThinkingMode();
     }
   }
   else if (type == "emotion") {
@@ -1255,9 +1662,10 @@ void handleJson(String payload) {
   else if (type == "speech_state") {
     bool speaking = doc["speaking"] | false;
 
-    if (speaking) {
+    if (speaking && !isSpeaking) {
       startSpeakingMode();
-    } else {
+    }
+    else if (!speaking && isSpeaking) {
       stopSpeakingMode();
     }
   }
@@ -1291,7 +1699,6 @@ void pollShanyUart() {
   }
 }
 
-// Permite probar desde el monitor serial pegando JSON manualmente
 void pollUsbSerialForTesting() {
   static String usbLine = "";
 
@@ -1320,6 +1727,26 @@ void pollUsbSerialForTesting() {
 // -----------------------------------------------------------------------------
 // ANIMACIONES
 // -----------------------------------------------------------------------------
+void updateEmotionTimeout() {
+  if (emotionHoldUntil == 0) {
+    return;
+  }
+
+  if (millis() < emotionHoldUntil) {
+    return;
+  }
+
+  emotionHoldUntil = 0;
+
+  if (!isSpeaking) {
+    activeConversationFace = FACE_DEFAULT;
+
+    if (sessionActive) {
+      requestFace(FACE_LISTENING);
+    }
+  }
+}
+
 void updateIdleAutoRotation() {
   if (sessionActive) {
     return;
@@ -1474,8 +1901,6 @@ void updateGaze() {
 void updateMouth() {
   unsigned long now = millis();
 
-  // Si está hablando pero no llegan nuevos niveles de boca,
-  // cerramos localmente para que no se quede congelada abierta.
   if (isSpeaking && (now - lastMouthPacketMs > MOUTH_PACKET_TIMEOUT_MS)) {
     mouthTarget = 0.0f;
   }
@@ -1484,9 +1909,9 @@ void updateMouth() {
     float alpha;
 
     if (mouthTarget > mouthDisplay) {
-      alpha = 0.55f;   // abre rápido
+      alpha = 0.55f;
     } else {
-      alpha = 0.48f;   // cierra bastante rápido
+      alpha = 0.48f;
     }
 
     mouthDisplay = ((1.0f - alpha) * mouthDisplay) + (alpha * mouthTarget);
@@ -1544,6 +1969,15 @@ void renderFace() {
 // -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  delay(500);
+
+  bootStartedAt = millis();
+
+  setupRgbLed();
+  setRgb(0, 0, 0);
+
+  setupIna();
+
   ShanyUart.begin(115200, SERIAL_8N1, SHANY_RX, SHANY_TX);
 
   pinMode(TFT_BL, OUTPUT);
@@ -1552,7 +1986,11 @@ void setup() {
   hspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
 
   tft.begin(40000000);
-  tft.setRotation(1);
+
+  // ROTACION CORREGIDA
+  // Si vuelve a quedar al reves, prueba 1.
+  tft.setRotation(3);
+
   tft.fillScreen(BLACK);
 
   randomSeed(micros());
@@ -1569,8 +2007,12 @@ void setup() {
   uiMode = UI_IDLE;
   idleCycle = IDLE_FACE_DEFAULT;
 
+  raspberryReady = false;
+  ledMode = LED_WAITING_RPI;
+
   Serial.println("Shany ESP32 face system ready");
   Serial.println("Esperando JSON por UART...");
+  Serial.println("LED apagado. Solo avisara bateria baja o Raspberry lista.");
 }
 
 // -----------------------------------------------------------------------------
@@ -1583,8 +2025,12 @@ void loop() {
   // Si no lo quieres, puedes comentar esta linea.
   pollUsbSerialForTesting();
 
+  updateIna();
+  updateStatusLed();
+
   updateIdleAutoRotation();
   updateSwapAnimation();
+  updateEmotionTimeout();
 
   if (swapState == SWAP_IDLE) {
     updateNormalBlink();

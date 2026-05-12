@@ -93,7 +93,7 @@ class ShanyConfig:
 
     # ── Audio DSP / Tuning ───────────────────────────────────────
     mic_gain: float = 5.0
-    mic_noise_threshold: int = 30
+    mic_noise_threshold: int = 500  # RMS post-AGC. Con AGC, voz ~2000-3000, ruido ~200-400
     output_gain: float = 2.5
     output_comp_threshold: float = 0.6
 
