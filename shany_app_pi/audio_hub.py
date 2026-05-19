@@ -8,10 +8,12 @@ silencio mientras él mismo está hablando (anti-eco).
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
@@ -58,12 +60,14 @@ class AudioHub:
             maxsize=config.hotword_q_maxsize
         )
 
-        # Cola mic → agente
-        self._send_q: queue.Queue[bytes] = queue.Queue(
+        # Cola mic -> agente/STT: (audio procesado real, VAD abierto)
+        self._send_q: queue.Queue[tuple[bytes, bool]] = queue.Queue(
             maxsize=config.send_q_maxsize
         )
         self._input_callback: Optional[Callable[[bytes], None]] = None
+        self._speech_segment_callback: Optional[Callable[[bytes, int], None]] = None
         self._cb_lock = threading.Lock()
+        self._speech_capture_enabled: bool = False
 
         # Cola agente → speaker: (generation_id, chunk)
         self._out_q: queue.Queue[tuple[int, bytes]] = queue.Queue(
@@ -77,6 +81,12 @@ class AudioHub:
         self._last_visual_emit: float = 0.0
         self._force_listen_until: float = 0.0
         self._drop_output_until: float = 0.0
+        self._agent_turn_active: bool = False
+        self._agent_turn_text_received: bool = False
+        self._agent_turn_started_at: float = 0.0
+        self._tts_busy: bool = False
+        self._last_elevenlabs_silence_ts: float = 0.0
+        self._elevenlabs_silence_burst_until: float = 0.0
 
         # Bloqueo extra del micrófono después de que Shany termina de hablar
         self._mic_guard_until: float = 0.0
@@ -84,16 +94,41 @@ class AudioHub:
 
         # Estado visual
         self._is_talking: bool = False
+        self._speech_soft_closed: bool = False
         self._smoothed_mouth: float = 0.0
         self._window_rms_max: float = 0.0  # Max RMS entre envíos visuales
 
         # VAD local para filtrar ruido antes de enviar al agente
         self._mic_vad_active: bool = False
         self._mic_vad_hold_until: float = 0.0
-        self._mic_vad_hold_sec: float = 0.30  # 300ms de hold post-voz
+        self._mic_vad_open_frames: int = 0
+        self._mic_vad_close_frames: int = 0
+        self._mic_vad_opened_at: float = 0.0
+        self._mic_vad_peak_rms: float = 0.0
+        self._vad_noise_threshold: int = self._load_vad_threshold()
+        self._vad_close_threshold: int = self._compute_vad_close_threshold()
+
+        # Calibración manual de ruido ambiente.
+        self._calibration_lock = threading.Lock()
+        self._calibrating_noise: bool = False
+        self._calibration_rms_samples: list[float] = []
+        log.info(
+            "VAD iniciado (threshold=%d RMS pre-AGC, close=%d)",
+            self._vad_noise_threshold,
+            self._vad_close_threshold,
+        )
+        if config.turn_stt_enabled and not config.elevenlabs_audio_input_with_turn_stt:
+            log.info("Audio real a ElevenLabs bloqueado; enviando silencio de mantenimiento")
 
         # AGC — Automatic Gain Control
         self._agc_gain: float = config.mic_gain  # Inicia en la ganancia base
+
+        # Segmentacion para STT por turno. Corre en _sender_loop, no en el
+        # callback de PyAudio.
+        self._stt_preroll: deque[bytes] = deque(maxlen=config.turn_stt_preroll_frames)
+        self._stt_frames: list[bytes] = []
+        self._stt_segment_active: bool = False
+        self._stt_segment_started_at: float = 0.0
 
         # Generación de playback (se incrementa en interrupt)
         self._playback_generation: int = 0
@@ -179,6 +214,27 @@ class AudioHub:
         with self._cb_lock:
             self._input_callback = None
 
+    def attach_speech_segment_callback(self, cb: Callable[[bytes, int], None]) -> None:
+        """Conecta el callback que recibe frases completas para STT."""
+        with self._cb_lock:
+            self._speech_segment_callback = cb
+
+    def detach_speech_segment_callback(self) -> None:
+        """Desconecta el callback STT."""
+        with self._cb_lock:
+            self._speech_segment_callback = None
+
+    def set_speech_capture_enabled(self, enabled: bool) -> None:
+        """Activa/desactiva la captura local de frases para STT."""
+        enabled = bool(enabled)
+        if self._speech_capture_enabled == enabled:
+            return
+        self._speech_capture_enabled = enabled
+        if enabled:
+            self.pulse_elevenlabs_silence()
+        if not enabled:
+            self._reset_stt_segment()
+
     # ── Estado / gating ──────────────────────────────────────────
 
     def agent_is_speaking(self) -> bool:
@@ -193,12 +249,20 @@ class AudioHub:
         if not self._out_q.empty():
             return True
 
+        if self._tts_busy:
+            return True
+
         # Protección corta después del último write real al parlante
         if (now - self._last_playback_write_ts) < self._post_speech_mic_guard_sec:
             return True
 
         # Protección explícita post-habla
         if now < self._mic_guard_until:
+            return True
+
+        # Mientras esperamos la respuesta del agente a un turno STT, no
+        # capturamos mic. Si algo se cuelga, el timeout libera el gate.
+        if self._agent_turn_active and not self._agent_turn_timed_out():
             return True
 
         return False
@@ -214,6 +278,216 @@ class AudioHub:
     def cancel_drop_window(self) -> None:
         """Cancela la ventana de drop (el agente empezó respuesta nueva)."""
         self._drop_output_until = 0.0
+
+    def note_agent_turn_started(self) -> None:
+        """Marca que ElevenLabs debe responder a un turno enviado por texto."""
+        self._agent_turn_active = True
+        self._agent_turn_text_received = False
+        self._agent_turn_started_at = time.time()
+        self.pulse_elevenlabs_silence()
+
+    def note_agent_text_received(self) -> None:
+        """Marca que ya llego el texto final del agente para este turno."""
+        self._agent_turn_text_received = True
+
+    def set_tts_busy(self, busy: bool) -> None:
+        """Indica si ElevenLabs aun esta generando audio de la respuesta."""
+        self._tts_busy = bool(busy)
+
+    def cancel_agent_turn_wait(self) -> None:
+        """Libera la espera de respuesta del agente sin tocar el audio."""
+        self._finish_agent_turn()
+
+    def _agent_turn_timed_out(self) -> bool:
+        if not self._agent_turn_active:
+            return False
+        return (time.time() - self._agent_turn_started_at) > self._cfg.agent_turn_max_wait_sec
+
+    def _finish_agent_turn(self) -> None:
+        self._agent_turn_active = False
+        self._agent_turn_text_received = False
+        self._agent_turn_started_at = 0.0
+
+    def pulse_elevenlabs_silence(self, secs: Optional[float] = None) -> None:
+        """Mantiene vivo brevemente el websocket sin enviar audio real."""
+        duration = self._cfg.elevenlabs_silence_burst_sec if secs is None else secs
+        self._elevenlabs_silence_burst_until = time.time() + max(0.0, duration)
+
+    # ── VAD / calibración ───────────────────────────────────────
+
+    def calibrate_noise_floor(self, secs: Optional[float] = None) -> dict[str, float]:
+        """
+        Mide el ruido ambiente y guarda un nuevo umbral VAD persistente.
+
+        Durante esta ventana nadie debería hablar cerca de Shany: queremos
+        capturar el "silencio ruidoso" del entorno.
+        """
+        duration = secs if secs is not None else self._cfg.vad_calibration_secs
+        duration = max(1.0, float(duration))
+
+        with self._calibration_lock:
+            if self._calibrating_noise:
+                return {
+                    "status": "already_running",
+                    "threshold": float(self._vad_noise_threshold),
+                }
+            self._calibration_rms_samples = []
+            self._calibrating_noise = True
+
+        log.info("Calibrando ruido ambiente durante %.1f s ...", duration)
+        time.sleep(duration)
+
+        with self._calibration_lock:
+            samples = list(self._calibration_rms_samples)
+            self._calibrating_noise = False
+            self._calibration_rms_samples = []
+
+        if not samples:
+            log.warning(
+                "Calibración VAD sin muestras; se conserva threshold=%d",
+                self._vad_noise_threshold,
+            )
+            return {
+                "status": "no_samples",
+                "threshold": float(self._vad_noise_threshold),
+            }
+
+        avg = float(np.mean(samples))
+        pctl = float(np.percentile(samples, self._cfg.vad_calibration_percentile))
+        threshold = self._clamp_vad_threshold(
+            int(pctl * self._cfg.vad_calibration_multiplier)
+        )
+
+        self._vad_noise_threshold = threshold
+        self._vad_close_threshold = self._compute_vad_close_threshold()
+        self._save_vad_calibration(avg=avg, percentile=pctl, threshold=threshold)
+
+        log.info(
+            "Calibración VAD lista: avg=%.1f p%.0f=%.1f threshold=%d close=%d samples=%d",
+            avg,
+            self._cfg.vad_calibration_percentile,
+            pctl,
+            self._vad_noise_threshold,
+            self._vad_close_threshold,
+            len(samples),
+        )
+        return {
+            "status": "ok",
+            "avg": avg,
+            "percentile": pctl,
+            "threshold": float(self._vad_noise_threshold),
+            "close_threshold": float(self._vad_close_threshold),
+            "samples": float(len(samples)),
+        }
+
+    def _clamp_vad_threshold(self, value: int) -> int:
+        return int(np.clip(value, self._cfg.vad_min_threshold, self._cfg.vad_max_threshold))
+
+    def _compute_vad_close_threshold(self) -> int:
+        return max(10, int(self._vad_noise_threshold * self._cfg.vad_close_ratio))
+
+    def _load_vad_threshold(self) -> int:
+        path = self._cfg.runtime_calibration_file
+        fallback = self._clamp_vad_threshold(self._cfg.vad_noise_threshold)
+
+        try:
+            if not path.is_file():
+                return fallback
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            threshold = int(data.get("vad_noise_threshold", fallback))
+            threshold = self._clamp_vad_threshold(threshold)
+            log.info("Calibración VAD cargada desde %s: threshold=%d", path, threshold)
+            return threshold
+        except Exception as exc:
+            log.warning(
+                "No se pudo cargar calibración VAD (%s); usando threshold=%d",
+                exc,
+                fallback,
+            )
+            return fallback
+
+    def _save_vad_calibration(self, *, avg: float, percentile: float, threshold: int) -> None:
+        path = self._cfg.runtime_calibration_file
+        payload = {
+            "vad_noise_threshold": threshold,
+            "vad_close_threshold": self._vad_close_threshold,
+            "noise_rms_avg": round(avg, 2),
+            "noise_rms_percentile": round(percentile, 2),
+            "percentile": self._cfg.vad_calibration_percentile,
+            "multiplier": self._cfg.vad_calibration_multiplier,
+            "saved_at_unix": int(time.time()),
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+        except Exception:
+            log.exception("No se pudo guardar calibración VAD en %s", path)
+
+    def _record_calibration_sample(self, raw_rms: float) -> None:
+        if not self._calibrating_noise:
+            return
+        with self._calibration_lock:
+            if self._calibrating_noise:
+                self._calibration_rms_samples.append(raw_rms)
+
+    def _update_vad_state(self, raw_rms: float, now_mono: float) -> bool:
+        """
+        VAD con histéresis: abre con varios frames consecutivos y cierra
+        rápido, sin cortar finales de palabra.
+        """
+        if self._mic_vad_active:
+            self._mic_vad_peak_rms = max(self._mic_vad_peak_rms, raw_rms)
+
+        if raw_rms >= self._vad_noise_threshold:
+            self._mic_vad_open_frames += 1
+            self._mic_vad_close_frames = 0
+        elif raw_rms < self._vad_close_threshold:
+            self._mic_vad_close_frames += 1
+            self._mic_vad_open_frames = 0
+        else:
+            # Zona intermedia: no abrir por ruido dudoso, pero tampoco cerrar
+            # de golpe si ya venía hablando.
+            self._mic_vad_open_frames = 0
+
+        if not self._mic_vad_active:
+            if self._mic_vad_open_frames >= self._cfg.vad_start_frames:
+                self._mic_vad_active = True
+                self._mic_vad_opened_at = now_mono
+                self._mic_vad_peak_rms = raw_rms
+                self._mic_vad_hold_until = now_mono + self._cfg.vad_hold_sec
+                log.info(
+                    "VAD abierto raw_rms=%.1f threshold=%d close=%d frames=%d",
+                    raw_rms,
+                    self._vad_noise_threshold,
+                    self._vad_close_threshold,
+                    self._cfg.vad_start_frames,
+                )
+        else:
+            if raw_rms >= self._vad_close_threshold:
+                self._mic_vad_hold_until = now_mono + self._cfg.vad_hold_sec
+            elif (
+                self._mic_vad_close_frames >= self._cfg.vad_stop_frames
+                and now_mono >= self._mic_vad_hold_until
+            ):
+                duration = max(0.0, now_mono - self._mic_vad_opened_at)
+                peak = self._mic_vad_peak_rms
+                self._mic_vad_active = False
+                self._mic_vad_open_frames = 0
+                self._mic_vad_close_frames = 0
+                self._mic_vad_opened_at = 0.0
+                self._mic_vad_peak_rms = 0.0
+                log.info(
+                    "VAD cerrado raw_rms=%.1f close=%d duration=%.2fs peak=%.1f",
+                    raw_rms,
+                    self._vad_close_threshold,
+                    duration,
+                    peak,
+                )
+
+        return self._mic_vad_active
 
     # ── Output (agente → speaker) ────────────────────────────────
 
@@ -261,6 +535,8 @@ class AudioHub:
             self._visual_bridge.send_speech_level(0.0)
         
         self._is_talking = False
+        self._speech_soft_closed = False
+        self._finish_agent_turn()
         self._smoothed_mouth = 0.0
         self._window_rms_max = 0.0
         self._mic_guard_until = 0.0
@@ -308,12 +584,28 @@ class AudioHub:
             except queue.Empty:
                 # Si la cola está vacía y estábamos hablando, checar si ya pasó el umbral de silencio
                 now = time.time()
-                if self._is_talking and (now - self._last_playback_write_ts > 0.55):
-                    log.debug("Fin de audio detectado (silencio > 550ms)")
+                silence = now - self._last_playback_write_ts
+                if self._is_talking and silence > self._cfg.output_soft_silence_sec:
+                    log.debug("Pausa de audio detectada (silencio > %.0fms)", self._cfg.output_soft_silence_sec * 1000)
 
-                    self._smoothed_mouth = 0.0
-                    self._window_rms_max = 0.0
+                    if not self._speech_soft_closed:
+                        self._smoothed_mouth = 0.0
+                        self._window_rms_max = 0.0
+                        self._speech_soft_closed = True
+                        if self._visual_bridge:
+                            self._visual_bridge.send_speech_level(0.0)
+
+                    can_finish_turn = (
+                        not self._agent_turn_active
+                        or self._agent_turn_text_received
+                        or self._agent_turn_timed_out()
+                    ) and not self._tts_busy
+                    if not can_finish_turn or silence <= self._cfg.output_final_silence_sec:
+                        continue
+
                     self._is_talking = False  # Marcar ANTES de enviar visual (evita repetir)
+                    self._speech_soft_closed = False
+                    self._finish_agent_turn()
 
                     # Mantener micrófono cerrado un poco más para evitar eco de última palabra
                     self._mic_guard_until = now + self._post_speech_mic_guard_sec
@@ -346,6 +638,7 @@ class AudioHub:
                             if not self._is_talking:
                                 self._visual_bridge.send_speech_state(True)
                                 self._is_talking = True
+                            self._speech_soft_closed = False
 
                             # Acumular RMS del chunk actual (raw)
                             rms = np.sqrt(np.mean(samples**2))
@@ -415,20 +708,101 @@ class AudioHub:
     def _sender_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                mic_bytes = self._send_q.get(timeout=0.25)
+                mic_bytes, voice_gate_open = self._send_q.get(timeout=0.25)
             except queue.Empty:
                 continue
 
             with self._cb_lock:
                 cb = self._input_callback
+                speech_cb = self._speech_segment_callback
+
+            allow_real_mic = self._should_send_real_mic()
+
+            if self._cfg.turn_stt_enabled and speech_cb is not None:
+                if not self._speech_capture_enabled:
+                    if self._stt_segment_active or self._stt_preroll:
+                        self._reset_stt_segment()
+                else:
+                    self._handle_stt_frame(
+                        mic_bytes,
+                        voice_gate_open and allow_real_mic,
+                        speech_cb,
+                    )
 
             if cb is None:
                 continue
 
-            if self._should_send_real_mic():
+            silence = b"\x00" * len(mic_bytes)
+
+            if (
+                self._cfg.turn_stt_enabled
+                and not self._cfg.elevenlabs_audio_input_with_turn_stt
+            ):
+                now = time.time()
+                should_send_silence = (
+                    now < self._elevenlabs_silence_burst_until
+                    or (now - self._last_elevenlabs_silence_ts)
+                    >= self._cfg.elevenlabs_silence_keepalive_sec
+                )
+                if should_send_silence:
+                    self._last_elevenlabs_silence_ts = now
+                    cb(silence)
+                continue
+
+            if allow_real_mic and (voice_gate_open or self._cfg.realtime_audio_passthrough):
                 cb(mic_bytes)
             else:
-                cb(b"\x00" * len(mic_bytes))
+                cb(silence)
+
+    def _handle_stt_frame(
+        self,
+        mic_bytes: bytes,
+        voice_frame: bool,
+        speech_cb: Callable[[bytes, int], None],
+    ) -> None:
+        if not voice_frame:
+            if self._stt_segment_active:
+                self._finalize_stt_segment(speech_cb)
+            else:
+                self._stt_preroll.append(mic_bytes)
+            return
+
+        if not self._stt_segment_active:
+            self._stt_segment_active = True
+            self._stt_segment_started_at = time.monotonic()
+            self._stt_frames = list(self._stt_preroll)
+            log.info("STT segmento abierto preroll_frames=%d", len(self._stt_frames))
+
+        self._stt_frames.append(mic_bytes)
+        if (
+            self._stt_segment_started_at
+            and (time.monotonic() - self._stt_segment_started_at) >= self._cfg.elevenlabs_stt_max_audio_sec
+        ):
+            log.info(
+                "STT segmento forzado por max %.1fs",
+                self._cfg.elevenlabs_stt_max_audio_sec,
+            )
+            self._finalize_stt_segment(speech_cb)
+
+    def _finalize_stt_segment(self, speech_cb: Callable[[bytes, int], None]) -> None:
+        if not self._stt_frames:
+            self._reset_stt_segment()
+            return
+
+        pcm = b"".join(self._stt_frames)
+        duration = len(pcm) / float(self._cfg.sample_rate * 2)
+        log.info("STT segmento cerrado duration=%.2fs bytes=%d", duration, len(pcm))
+        self._reset_stt_segment()
+        try:
+            speech_cb(pcm, self._cfg.sample_rate)
+        except Exception:
+            log.exception("Error entregando segmento a STT")
+
+    def _reset_stt_segment(self) -> None:
+        self._stt_frames = []
+        self._stt_segment_active = False
+        self._stt_segment_started_at = 0.0
+        self._stt_preroll.clear()
 
     # ── PyAudio callback (debe ser rápido) ───────────────────────
 
@@ -440,16 +814,18 @@ class AudioHub:
 
         # 1) Eliminar DC offset (rumble eléctrico del INMP441)
         raw -= np.mean(raw)
+        raw_rms = float(np.sqrt(np.mean(raw ** 2)))
+        self._record_calibration_sample(raw_rms)
 
         # 2) AGC — Automatic Gain Control
-        #    Ajusta la ganancia dinámicamente: amplifica mucho cuando
-        #    estás lejos del mic, poco cuando estás cerca. Así ElevenLabs
-        #    siempre recibe un volumen consistente (~3000 RMS).
-        frame_rms = float(np.sqrt(np.mean(raw ** 2)))
+        #    El VAD decide con RMS pre-AGC para que el ruido de fondo no se
+        #    convierta en "voz" solo porque la ganancia lo levantó.
+        now_mono = time.monotonic()
+        voice_gate_open = self._update_vad_state(raw_rms, now_mono)
 
-        if frame_rms > 15.0:  # Por encima del piso de ruido del INMP441
-            target_gain = 3000.0 / max(frame_rms, 1.0)
-            target_gain = float(np.clip(target_gain, 1.0, 25.0))
+        if voice_gate_open:
+            target_gain = 3000.0 / max(raw_rms, 1.0)
+            target_gain = float(np.clip(target_gain, 1.0, 20.0))
 
             if target_gain < self._agc_gain:
                 alpha = 0.5    # Baja rápido (protege contra clipping)
@@ -470,19 +846,7 @@ class AudioHub:
         #    abierto 300ms extra para no cortar finales de palabras.
         #    Solo envía silencio al agente cuando hay silencio real.
         #    El hotword SIEMPRE recibe audio real (no se aplica gate ahí).
-        rms = int(np.sqrt(np.mean(processed.astype(np.float32) ** 2)))
-        now_mono = time.monotonic()
-
-        if rms >= self._cfg.mic_noise_threshold:
-            # Voz detectada: activar VAD y extender ventana de hold
-            self._mic_vad_active = True
-            self._mic_vad_hold_until = now_mono + self._mic_vad_hold_sec
-        elif now_mono >= self._mic_vad_hold_until:
-            # Silencio sostenido tras el hold: cerrar gate
-            self._mic_vad_active = False
-
         processed_bytes = processed.tobytes()
-        agent_bytes = processed_bytes if self._mic_vad_active else b"\x00" * len(processed_bytes)
 
         # 1) Hotword recibe SIEMPRE audio real (ya amplificado)
         try:
@@ -496,14 +860,15 @@ class AudioHub:
         except Exception:
             pass
 
-        # 2) Cola mic → agente (con noise gate aplicado)
+        # 2) Cola mic -> agente/STT. El sender decide si entrega audio real,
+        #    silencio a ElevenLabs, o segmento local a OpenAI.
         try:
             if self._send_q.full():
                 try:
                     self._send_q.get_nowait()
                 except Exception:
                     pass
-            self._send_q.put_nowait(agent_bytes)
+            self._send_q.put_nowait((processed_bytes, voice_gate_open))
         except Exception:
             pass
 
@@ -530,4 +895,7 @@ class HubAudioInterface(AudioInterface):
         self._hub.output(audio)
 
     def interrupt(self) -> None:
-        self._hub.interrupt()
+        # NO-OP: El SDK llama esto internamente (correcciones, etc.)
+        # pero nosotros NO queremos que corte el audio.
+        # Solo el botón físico (app.py → self._hub.interrupt()) puede interrumpir.
+        log.debug("SDK solicitó interrupt — ignorado (solo botón físico puede interrumpir)")

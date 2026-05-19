@@ -1,0 +1,23 @@
+[Unit]
+Description=Shany AI Assistant (OpenAI Realtime + ElevenLabs TTS)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ietsi
+Group=ietsi
+WorkingDirectory=/home/ietsi/shany_realtime
+Environment=PYTHONPATH=/home/ietsi/shany_realtime
+Environment=HOME=/home/ietsi
+ExecStart=/home/ietsi/shany_env/bin/python3 -m shany_app_pi.realtime_main
+ExecStartPre=-/usr/bin/pkill -f [s]hany_app_pi.realtime_main
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shany
+
+[Install]
+WantedBy=multi-user.target

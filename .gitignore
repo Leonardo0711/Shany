@@ -14,3 +14,4 @@ Thumbs.db
 
 # Shany Specific
 /shany_app_pi/.env
+/shany_app_pi/runtime_calibration.json
