@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import random
 import signal
 import threading
 import time
+import unicodedata
 from typing import Optional
 
 from shany_app_pi.audio_hub import AudioHub
@@ -17,6 +19,16 @@ from shany_app_pi.openai_realtime_manager import OpenAIRealtimeManager
 from shany_app_pi.shany_prompt import SHANY_INITIAL_GREETING_PARTS
 
 log = logging.getLogger(__name__)
+
+USER_FAREWELL_MESSAGE = (
+    "Gracias por conversar conmigo. Me alegro mucho de haber estado contigo un ratito. "
+    "Ahora voy a descansar. Chau."
+)
+
+SESSION_LIMIT_FAREWELL_MESSAGE = (
+    "Me encanto conversar contigo. Ahora tengo que ir a acompanar a mas ninos, "
+    "pero gracias por compartir este ratito conmigo. Te mando una sonrisa grande. Chau."
+)
 
 
 class _DeltaTextChunker:
@@ -97,6 +109,9 @@ class ShanyRealtimeApp:
         self._manual_end_hotword_block_sec = 45.0
         self._wake_allowed_at = 0.0
         self._end_after_response = False
+        self._farewell_in_progress = False
+        self._session_soft_end_at = 0.0
+        self._farewell_lock = threading.Lock()
         self._stop = threading.Event()
 
         self._btn = SmartButton(
@@ -129,16 +144,21 @@ class ShanyRealtimeApp:
 
     def _main_loop(self) -> None:
         while not self._stop.is_set():
+            if self._should_start_session_farewell():
+                self._start_farewell(
+                    reason="session_soft_limit",
+                    message=SESSION_LIMIT_FAREWELL_MESSAGE,
+                )
             time.sleep(0.2)
 
     def _trigger_button_click(self) -> None:
-        if self._active:
+        if self._active or self._farewell_in_progress:
             log.info("Boton: click simple ignorado con sesion activa")
             return
         self._trigger_wake(from_button=True)
 
     def _trigger_wake(self, *, from_button: bool = False) -> None:
-        if self._active or self._noise_calibration_active:
+        if self._active or self._noise_calibration_active or self._farewell_in_progress:
             return
         if not from_button and time.time() < self._wake_allowed_at:
             log.info("Wake ignorado: sistema aun armando hotword")
@@ -148,6 +168,7 @@ class ShanyRealtimeApp:
         log.info("Realtime Wake: abriendo sesion")
         self._active = True
         self._last_wake_time = time.time()
+        self._session_soft_end_at = self._compute_session_soft_end_at(self._last_wake_time)
         self._emotion.send_ui_state("listening")
         self._chunker.reset()
         self._tts.cancel()
@@ -155,11 +176,16 @@ class ShanyRealtimeApp:
         self._hub.attach_input_callback(self._openai.submit_audio)
         self._hub.note_agent_turn_started()
         self._end_after_response = False
+        self._farewell_in_progress = False
+        log.info(
+            "Sesion Shany: cierre suave programado en %.1f min",
+            max(0.0, self._session_soft_end_at - self._last_wake_time) / 60.0,
+        )
         self._speak_initial_greeting()
         self._hub.note_agent_text_received()
 
     def _trigger_interrupt(self) -> None:
-        if not self._active:
+        if not self._active or self._farewell_in_progress:
             return
         log.info("Realtime Interrupt: cortando respuesta")
         self._chunker.reset()
@@ -169,11 +195,13 @@ class ShanyRealtimeApp:
         self._emotion.send_ui_state("listening")
 
     def _trigger_end_session(self) -> None:
-        if not self._active:
+        if not self._active and not self._farewell_in_progress:
             return
         log.info("Realtime End: cerrando sesion")
         self._active = False
+        self._farewell_in_progress = False
         self._end_after_response = False
+        self._session_soft_end_at = 0.0
         self._last_end_session_time = time.time()
         self._hub.detach_input_callback()
         self._chunker.reset()
@@ -237,7 +265,7 @@ class ShanyRealtimeApp:
 
     def _on_user_transcript(self, transcript: str) -> None:
         log.info("User(OpenAI): %s", transcript)
-        lower = transcript.lower()
+        lower = self._normalize_text(transcript)
         end_markers = (
             "chao",
             "chau",
@@ -255,10 +283,79 @@ class ShanyRealtimeApp:
         )
         if any(marker in lower for marker in end_markers):
             log.info("Fin de sesion solicitado por voz")
-            self._chunker.reset()
-            self._tts.cancel()
-            self._openai.cancel_response()
-            threading.Timer(0.2, self._trigger_end_session).start()
+            threading.Thread(
+                target=self._start_farewell,
+                kwargs={"reason": "voice_farewell", "message": USER_FAREWELL_MESSAGE},
+                daemon=True,
+                name="voice-farewell",
+            ).start()
+
+    def _compute_session_soft_end_at(self, started_at: float) -> float:
+        base = max(60.0, float(self._cfg.session_soft_limit_sec))
+        jitter = max(0.0, float(self._cfg.session_soft_limit_jitter_sec))
+        return started_at + base + (random.uniform(0.0, jitter) if jitter else 0.0)
+
+    def _should_start_session_farewell(self) -> bool:
+        return (
+            self._active
+            and not self._farewell_in_progress
+            and self._session_soft_end_at > 0.0
+            and time.time() >= self._session_soft_end_at
+            and not self._hub.agent_is_speaking()
+        )
+
+    def _start_farewell(self, *, reason: str, message: str) -> None:
+        with self._farewell_lock:
+            if not self._active or self._farewell_in_progress:
+                return
+            self._active = False
+            self._farewell_in_progress = True
+            self._end_after_response = False
+            self._session_soft_end_at = 0.0
+            self._last_end_session_time = time.time()
+
+        log.info("Despedida Shany iniciada (%s)", reason)
+        self._hub.detach_input_callback()
+        self._chunker.reset()
+        self._openai.cancel_response()
+        self._openai.stop()
+        self._tts.cancel()
+        self._hub.interrupt()
+        self._emotion.set_emotion(
+            {
+                "emotion": "alegria_suave",
+                "intensity": 0.78,
+                "duration_ms": 18000,
+                "blink": True,
+            }
+        )
+        self._emotion.send_ui_state("idle")
+        self._tts.speak(message)
+        threading.Thread(
+            target=self._finish_farewell_when_quiet,
+            args=(reason,),
+            daemon=True,
+            name="farewell-close",
+        ).start()
+
+    def _finish_farewell_when_quiet(self, reason: str) -> None:
+        min_wait_sec = 2.0
+        max_wait_sec = 22.0
+        started_at = time.time()
+        time.sleep(min_wait_sec)
+        while (time.time() - started_at) < max_wait_sec:
+            if not self._hub.agent_is_speaking():
+                break
+            time.sleep(0.2)
+
+        log.info("Despedida Shany terminada (%s)", reason)
+        self._tts.cancel()
+        self._hub.interrupt()
+        self._emotion.send_ui_state("idle")
+        self._wake_allowed_at = time.time() + self._manual_end_hotword_block_sec
+        with self._farewell_lock:
+            self._farewell_in_progress = False
+            self._active = False
 
     _EMOTION_PATTERNS = {
         "empatia": [
@@ -380,6 +477,13 @@ class ShanyRealtimeApp:
                 "duration_ms": 16000,
                 "blink": True,
             }
+        )
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        normalized = unicodedata.normalize("NFD", text.lower())
+        return "".join(
+            ch for ch in normalized if unicodedata.category(ch) != "Mn"
         )
 
     def _setup_signal_handlers(self) -> None:

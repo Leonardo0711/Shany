@@ -99,6 +99,12 @@ class ShanyConfig:
 
     # ── Timeout de sesión ────────────────────────────────────────
     inactivity_timeout_sec: float = 300.0
+    session_soft_limit_sec: float = field(
+        default_factory=lambda: float(os.environ.get("SHANY_SESSION_SOFT_LIMIT_SEC", "900"))
+    )
+    session_soft_limit_jitter_sec: float = field(
+        default_factory=lambda: float(os.environ.get("SHANY_SESSION_SOFT_LIMIT_JITTER_SEC", "120"))
+    )
 
     # ── Audio Hub internos (Optimizados para Pi Zero 2W) ─────────
     output_frames_per_buffer: int = 4096  # Aumentado para evitar underruns
