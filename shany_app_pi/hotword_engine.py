@@ -8,6 +8,7 @@ exponiendo una API limpia para el orquestador.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 from eff_word_net.audio_processing import Resnet50_Arc_loss
@@ -32,6 +33,7 @@ class HotwordEngine:
 
     def __init__(self, config: ShanyConfig, hub: AudioHub) -> None:
         self._cfg = config
+        self._last_wake_candidate_log = 0.0
 
         # Modelo base compartido por ambos detectores
         self._model = Resnet50_Arc_loss()
@@ -83,6 +85,16 @@ class HotwordEngine:
         result = self._wake_detector.scoreFrame(frame)
         if result and result.get("match"):
             return float(result["confidence"])
+        if result:
+            confidence = float(result.get("confidence", 0.0))
+            now = time.monotonic()
+            if confidence >= 0.45 and (now - self._last_wake_candidate_log) >= 1.0:
+                self._last_wake_candidate_log = now
+                log.info(
+                    "Hotword wake candidato conf=%.3f threshold=%.2f",
+                    confidence,
+                    self._cfg.wake_threshold,
+                )
         return None
 
     def check_interrupt(self, frame: np.ndarray) -> Optional[float]:

@@ -111,9 +111,10 @@ class ElevenLabsTTSStreamer:
                 "text": text,
                 "model_id": self._cfg.elevenlabs_tts_model,
                 "voice_settings": {
-                    "stability": 0.55,
-                    "similarity_boost": 0.75,
-                    "style": 0.2,
+                    "stability": 0.52,
+                    "similarity_boost": 0.78,
+                    "style": 0.32,
+                    "speed": self._cfg.elevenlabs_tts_speed,
                     "use_speaker_boost": True,
                 },
             },
@@ -141,6 +142,9 @@ class ElevenLabsTTSStreamer:
                 chunk = resp.read(4096)
                 if not chunk:
                     return
+                with self._generation_lock:
+                    if generation != self._generation:
+                        return
                 self._on_audio(chunk)
         finally:
             try:

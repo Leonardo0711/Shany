@@ -49,7 +49,11 @@ class OpenAIRealtimeManager:
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
-            return
+            log.warning("OpenAI Realtime: hilo anterior aun vivo; intentando cerrar antes de reiniciar")
+            self.stop()
+            if self._thread and self._thread.is_alive():
+                log.warning("OpenAI Realtime: no se pudo reiniciar, hilo anterior sigue vivo")
+                return
         self._stop.clear()
         self._connected.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True, name="openai-realtime")
@@ -59,9 +63,26 @@ class OpenAIRealtimeManager:
         self._stop.set()
         self._connected.clear()
         if self._loop:
-            self._loop.call_soon_threadsafe(lambda: None)
+            if self._audio_q is not None:
+                def _wake_audio_loop() -> None:
+                    try:
+                        self._audio_q.put_nowait(b"")
+                    except Exception:
+                        pass
+
+                self._loop.call_soon_threadsafe(_wake_audio_loop)
+            if self._ws is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+                    fut.result(timeout=1.5)
+                except Exception as exc:
+                    log.debug("OpenAI Realtime: cierre websocket no confirmado: %s", exc)
+            else:
+                self._loop.call_soon_threadsafe(lambda: None)
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=5.0)
+        if self._thread and not self._thread.is_alive():
+            self._thread = None
 
     def submit_audio(self, pcm16_16k: bytes) -> None:
         if not self._loop or not self._audio_q or not self._connected.is_set():
@@ -183,6 +204,8 @@ class OpenAIRealtimeManager:
         assert self._audio_q is not None
         while not self._stop.is_set():
             pcm16_16k = await self._audio_q.get()
+            if self._stop.is_set() or not pcm16_16k:
+                break
             pcm16_24k = self._resample_pcm16(pcm16_16k, self._cfg.sample_rate, self._cfg.openai_realtime_input_rate)
             await self._send(
                 {

@@ -86,7 +86,7 @@ class ShanyConfig:
     window_length_secs: float = 1.50
 
     # ── Hotword thresholds ───────────────────────────────────────
-    wake_threshold: float = 0.70
+    wake_threshold: float = 0.62
     wake_relaxation: float = 2.0
     interrupt_threshold: float = 0.63
     interrupt_relaxation: float = 0.8
@@ -95,6 +95,7 @@ class ShanyConfig:
     force_listen_secs: float = 3.0
     drop_agent_audio_secs: float = 1.0
     wake_to_interrupt_block_sec: float = 1.5
+    startup_wake_grace_sec: float = 12.0
 
     # ── Timeout de sesión ────────────────────────────────────────
     inactivity_timeout_sec: float = 300.0
@@ -109,7 +110,7 @@ class ShanyConfig:
     # ── Audio DSP / Tuning ───────────────────────────────────────
     mic_gain: float = 5.0
     mic_noise_threshold: int = 500  # Compatibilidad: umbral antiguo post-AGC.
-    output_gain: float = 0.5  # 20% del volumen original
+    output_gain: float = 0.75  # 75% del volumen original
     output_comp_threshold: float = 0.6
     output_soft_silence_sec: float = 0.55
     output_final_silence_sec: float = 0.95
@@ -171,7 +172,7 @@ class ShanyConfig:
     openai_realtime_input_rate: int = 24_000
     openai_realtime_vad_threshold: float = 0.50
     openai_realtime_prefix_padding_ms: int = 180
-    openai_realtime_silence_duration_ms: int = 450
+    openai_realtime_silence_duration_ms: int = 2000
     elevenlabs_tts_model: str = field(
         default_factory=lambda: os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5")
     )
@@ -180,6 +181,9 @@ class ShanyConfig:
     )
     elevenlabs_tts_latency: int = 3
     elevenlabs_tts_flush_chars: int = 110
+    elevenlabs_tts_speed: float = field(
+        default_factory=lambda: float(os.environ.get("ELEVENLABS_TTS_SPEED", "0.92"))
+    )
 
     # ── Propiedades derivadas ────────────────────────────────────
     @property

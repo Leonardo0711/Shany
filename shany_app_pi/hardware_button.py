@@ -26,7 +26,7 @@ class SmartButton:
         on_long_hold: Optional[Callable[[], None]] = None,
         hold_time: float = 1.0,
         long_hold_time: float = 3.5,
-        double_click_threshold: float = 0.5
+        double_click_threshold: float = 0.75
     ):
         """
         Inicializa un botón inteligente.
@@ -48,6 +48,7 @@ class SmartButton:
         self.long_hold_time = long_hold_time
 
         self._last_click_time = 0.0
+        self._pressed_at = 0.0
         self._was_held = False
         self._long_hold_fired = False
         self._timer: Optional[threading.Timer] = None
@@ -68,8 +69,10 @@ class SmartButton:
 
     def _pressed(self) -> None:
         with self._lock:
+            self._pressed_at = time.time()
             self._was_held = False
             self._long_hold_fired = False
+            log.info("SmartButton: presionado")
             if self._long_hold_timer is not None:
                 self._long_hold_timer.cancel()
                 self._long_hold_timer = None
@@ -82,7 +85,7 @@ class SmartButton:
     def _held(self) -> None:
         with self._lock:
             self._was_held = True
-            log.debug("SmartButton: Emitiendo Hold")
+            log.info("SmartButton: hold")
         self.on_hold()
 
     def _trigger_long_hold(self) -> None:
@@ -100,17 +103,19 @@ class SmartButton:
             self._long_hold_timer = None
 
         if self.on_long_hold is not None:
-            log.debug("SmartButton: Emitiendo Long Hold")
+            log.info("SmartButton: hold largo")
             threading.Thread(target=self.on_long_hold, daemon=True).start()
 
     def _trigger_single(self) -> None:
         with self._lock:
             self._timer = None
-        log.debug("SmartButton: Emitiendo Single Click")
+        log.info("SmartButton: click simple")
         self.on_single_click()
 
     def _released(self) -> None:
         with self._lock:
+            held_for = time.time() - self._pressed_at if self._pressed_at else 0.0
+            log.info("SmartButton: soltado tras %.2fs", held_for)
             if self._long_hold_timer is not None:
                 self._long_hold_timer.cancel()
                 self._long_hold_timer = None
@@ -125,7 +130,7 @@ class SmartButton:
                     self._timer.cancel()
                     self._timer = None
                 self._last_click_time = 0.0  # Reiniciar para evitar triples
-                log.debug("SmartButton: Emitiendo Double Click")
+                log.info("SmartButton: doble click")
                 # Llamar fuera del lock es opcional, pero aquí está bien
                 threading.Thread(target=self.on_double_click, daemon=True).start()
             else:

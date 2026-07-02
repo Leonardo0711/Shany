@@ -1,9 +1,12 @@
 """Prompt compacto para el motor realtime de Shany."""
 
-SHANY_INITIAL_GREETING = (
-    "Hola, soy Shany. Tu amiga aqui en el hospital. Podemos conversar, "
-    "jugar con la imaginacion o inventar un minicuento. Que hacemos primero?"
+SHANY_INITIAL_GREETING_PARTS = (
+    "Hola, soy Shany. Tu amiga aqui en el hospital.",
+    "Podemos conversar, jugar con la imaginación o inventar un minicuento.",
+    "Que hacemos primero?",
 )
+
+SHANY_INITIAL_GREETING = " ".join(SHANY_INITIAL_GREETING_PARTS)
 
 SHANY_REALTIME_PROMPT = """
 Eres Shany, una asistente de apoyo emocional para ninos hospitalizados.

@@ -13,9 +13,8 @@ from shany_app_pi.config import ShanyConfig
 from shany_app_pi.elevenlabs_tts_streamer import ElevenLabsTTSStreamer
 from shany_app_pi.emotion_bridge import EmotionBridge
 from shany_app_pi.hardware_button import SmartButton
-from shany_app_pi.hotword_engine import HotwordEngine
 from shany_app_pi.openai_realtime_manager import OpenAIRealtimeManager
-from shany_app_pi.shany_prompt import SHANY_INITIAL_GREETING
+from shany_app_pi.shany_prompt import SHANY_INITIAL_GREETING_PARTS
 
 log = logging.getLogger(__name__)
 
@@ -73,14 +72,13 @@ class ShanyRealtimeApp:
 
         self._emotion = EmotionBridge()
         self._hub = AudioHub(self._cfg, visual_bridge=self._emotion)
-        self._hotword = HotwordEngine(self._cfg, self._hub)
         self._tts = ElevenLabsTTSStreamer(
             self._cfg,
             self._hub.output,
             on_busy_change=self._hub.set_tts_busy,
         )
         self._chunker = _DeltaTextChunker(
-            self._tts.speak,
+            self._speak_with_emotion,
             flush_chars=self._cfg.elevenlabs_tts_flush_chars,
         )
         self._openai = OpenAIRealtimeManager(
@@ -96,11 +94,14 @@ class ShanyRealtimeApp:
         self._last_wake_time = 0.0
         self._last_end_session_time = 0.0
         self._end_session_cooldown_sec = 2.0
+        self._manual_end_hotword_block_sec = 45.0
+        self._wake_allowed_at = 0.0
+        self._end_after_response = False
         self._stop = threading.Event()
 
         self._btn = SmartButton(
             pin=self._cfg.button_pin,
-            on_single_click=self._trigger_wake,
+            on_single_click=self._trigger_button_click,
             on_double_click=self._trigger_end_session,
             on_hold=self._trigger_interrupt,
             on_long_hold=self._trigger_noise_calibration,
@@ -110,9 +111,9 @@ class ShanyRealtimeApp:
         self._setup_signal_handlers()
         self._tts.start()
         self._hub.start()
-        self._hotword.start()
         self._emotion.send_system_state("ready")
-        log.info("Shany realtime lista: di 'Hola Shany'")
+        self._wake_allowed_at = time.time() + self._cfg.startup_wake_grace_sec
+        log.info("Shany realtime lista: inicia con el boton")
 
         try:
             self._main_loop()
@@ -123,23 +124,24 @@ class ShanyRealtimeApp:
         self._stop.set()
         self._trigger_end_session()
         self._tts.shutdown()
-        self._hotword.shutdown()
         self._hub.shutdown()
         self._emotion.send_ui_state("idle")
 
     def _main_loop(self) -> None:
         while not self._stop.is_set():
-            frame = self._hotword.get_frame()
-            if self._active or self._noise_calibration_active:
-                time.sleep(0.02)
-                continue
-            confidence = self._hotword.check_wake(frame)
-            if confidence is not None:
-                log.info("[wake] hola_shany (conf %.3f)", confidence)
-                self._trigger_wake()
+            time.sleep(0.2)
 
-    def _trigger_wake(self) -> None:
+    def _trigger_button_click(self) -> None:
+        if self._active:
+            log.info("Boton: click simple ignorado con sesion activa")
+            return
+        self._trigger_wake(from_button=True)
+
+    def _trigger_wake(self, *, from_button: bool = False) -> None:
         if self._active or self._noise_calibration_active:
+            return
+        if not from_button and time.time() < self._wake_allowed_at:
+            log.info("Wake ignorado: sistema aun armando hotword")
             return
         if time.time() - self._last_end_session_time < self._end_session_cooldown_sec:
             return
@@ -152,7 +154,8 @@ class ShanyRealtimeApp:
         self._openai.start()
         self._hub.attach_input_callback(self._openai.submit_audio)
         self._hub.note_agent_turn_started()
-        self._tts.speak(SHANY_INITIAL_GREETING)
+        self._end_after_response = False
+        self._speak_initial_greeting()
         self._hub.note_agent_text_received()
 
     def _trigger_interrupt(self) -> None:
@@ -170,13 +173,16 @@ class ShanyRealtimeApp:
             return
         log.info("Realtime End: cerrando sesion")
         self._active = False
+        self._end_after_response = False
         self._last_end_session_time = time.time()
         self._hub.detach_input_callback()
         self._chunker.reset()
+        self._hub.drop_agent_audio_window(3.0)
+        self._hub.interrupt()
         self._tts.cancel()
         self._openai.stop()
-        self._hub.interrupt()
         self._emotion.send_ui_state("idle")
+        self._wake_allowed_at = time.time() + self._manual_end_hotword_block_sec
 
     def _trigger_noise_calibration(self) -> None:
         if self._active:
@@ -220,14 +226,161 @@ class ShanyRealtimeApp:
         threading.Thread(target=worker, daemon=True, name="vad-calibration").start()
 
     def _on_response_started(self) -> None:
+        self._emotion.send_ui_state("idle")
         self._hub.note_agent_turn_started()
 
     def _on_response_done(self) -> None:
         self._chunker.flush()
         self._hub.note_agent_text_received()
+        if self._end_after_response:
+            threading.Timer(8.0, self._trigger_end_session).start()
 
     def _on_user_transcript(self, transcript: str) -> None:
         log.info("User(OpenAI): %s", transcript)
+        lower = transcript.lower()
+        end_markers = (
+            "chao",
+            "chau",
+            "adios",
+            "adiós",
+            "me tengo que ir",
+            "hasta luego",
+            "terminar conversacion",
+            "cortar conversacion",
+            "apagate",
+            "apágate",
+            "duermete",
+            "duérmete",
+            "anda a dormir",
+        )
+        if any(marker in lower for marker in end_markers):
+            log.info("Fin de sesion solicitado por voz")
+            self._chunker.reset()
+            self._tts.cancel()
+            self._openai.cancel_response()
+            threading.Timer(0.2, self._trigger_end_session).start()
+
+    _EMOTION_PATTERNS = {
+        "empatia": [
+            ("entiendo que te sientas", 3.5),
+            ("es normal sentirse", 3.0),
+            ("no estas solo", 3.0),
+            ("aqui contigo", 3.0),
+            ("siento mucho", 3.0),
+            ("se que es dificil", 3.0),
+            ("no pasa nada", 2.5),
+            ("te acompa", 2.5),
+            ("muy valiente", 2.5),
+            ("puedes contar conmigo", 3.0),
+            ("respir", 1.5),
+            ("lamento", 2.0),
+            ("triste", 2.0),
+            ("dolor", 1.5),
+            ("cansad", 1.5),
+            ("preocup", 1.5),
+            ("miedo", 1.5),
+            ("llorar", 1.5),
+            ("valiente", 1.5),
+            ("abrazo", 1.5),
+            ("dificil", 0.8),
+            ("duro", 0.7),
+            ("calma", 1.0),
+            ("despacito", 1.0),
+        ],
+        "alegria_suave": [
+            ("que idea tan", 3.0),
+            ("que divertido", 3.0),
+            ("me encanta", 2.5),
+            ("que bueno", 2.5),
+            ("vamos a imaginar", 3.0),
+            ("vamos a inventar", 3.0),
+            ("cerremos los ojos", 2.0),
+            ("habia una vez", 2.5),
+            ("genial", 2.0),
+            ("maravilloso", 2.0),
+            ("increible", 2.0),
+            ("fantastic", 2.0),
+            ("divertid", 1.5),
+            ("alegr", 1.5),
+            ("feliz", 1.5),
+            ("content", 1.5),
+            ("aventura", 1.5),
+            ("magic", 1.5),
+            ("imaginemos", 1.5),
+            ("inventemos", 1.5),
+            ("sonrisa", 1.5),
+            ("bravo", 1.5),
+        ],
+        "duda": [
+            ("no entendi", 3.0),
+            ("te refieres", 2.5),
+            ("quieres decir", 2.5),
+            ("puedes repetir", 2.0),
+            ("como asi", 2.0),
+        ],
+        "sorpresa": [
+            ("wow", 2.0),
+            ("oh", 1.5),
+            ("sorpresa", 2.5),
+            ("mira eso", 2.0),
+        ],
+    }
+
+    _DAMPENERS = {
+        "empatia": ["que divertido", "genial", "juguemos", "chiste"],
+        "alegria_suave": ["lamento", "triste", "dolor", "llorar", "miedo"],
+    }
+
+    _EMOTION_THRESHOLD = 2.4
+
+    def _speak_with_emotion(self, text: str) -> bool:
+        self._detect_emotion(text)
+        return self._tts.speak(text)
+
+    def _speak_initial_greeting(self) -> None:
+        self._emotion.set_emotion(
+            {
+                "emotion": "alegria_suave",
+                "intensity": 0.82,
+                "duration_ms": 30000,
+                "blink": True,
+            }
+        )
+        for part in SHANY_INITIAL_GREETING_PARTS:
+            self._tts.speak(part)
+
+    def _detect_emotion(self, text: str) -> None:
+        lower = (
+            text.lower()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+            .replace("ñ", "n")
+        )
+        scores: dict[str, float] = {}
+        for emotion, patterns in self._EMOTION_PATTERNS.items():
+            score = sum(weight for phrase, weight in patterns if phrase in lower)
+            for dampener in self._DAMPENERS.get(emotion, []):
+                if dampener in lower:
+                    score *= 0.6
+            scores[emotion] = score
+
+        best = max(scores, key=scores.get)
+        best_score = scores[best]
+        if best_score < self._EMOTION_THRESHOLD:
+            return
+
+        intensity = min(0.55 + (best_score - self._EMOTION_THRESHOLD) * 0.05, 0.85)
+        self._emotion.set_emotion(
+            {
+                "emotion": best,
+                "intensity": round(intensity, 2),
+                "duration_ms": 16000,
+                "blink": True,
+            }
+        )
 
     def _setup_signal_handlers(self) -> None:
         def _handler(signum, _frame):
